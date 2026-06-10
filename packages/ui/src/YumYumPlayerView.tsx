@@ -36,7 +36,7 @@ export interface PlayerHandle {
     playbackRate: number;
     renderedFrames: number;
     activeCodec: string;
-    [k: string]: unknown;
+    queueLength: number;
   };
   on(event: string, callback: (...args: unknown[]) => void): void;
   off(event: string, callback: (...args: unknown[]) => void): void;
@@ -339,7 +339,7 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
           // so a brief gap (e.g. right after a seek) doesn't flash it, and clear
           // it instantly the moment frames start flowing again.
           const tickStalled = playing && tel.renderedFrames === lastFrames
-            && (tel.queueLength as number) === 0 && tel.activeCodec !== 'mjpeg';
+            && tel.queueLength === 0 && tel.activeCodec !== 'mjpeg';
           stallTicks = tickStalled ? stallTicks + 1 : 0;
           setIsBuffering(stallTicks >= 3);
           lastFrames = tel.renderedFrames;
