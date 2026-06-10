@@ -1,0 +1,39 @@
+name: Publish to npm
+
+# Publishes @yumyum-player/core and @yumyum-player/ui to npm.
+# Trigger by creating a GitHub Release (tag it e.g. v0.1.0), or run manually.
+# Requires a repository secret NPM_TOKEN (an npm automation token with publish
+# rights to the @yumyum-player scope).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Publish @yumyum-player/core
+        run: npm publish --workspace @yumyum-player/core --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish @yumyum-player/ui
+        run: npm publish --workspace @yumyum-player/ui --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

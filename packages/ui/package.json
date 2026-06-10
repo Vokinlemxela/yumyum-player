@@ -1,15 +1,7 @@
 {
   "name": "@yumyum-player/ui",
-  "version": "1.0.0",
-  "private": true,
-  "description": "React player shell <YumYumPlayerView> for Yum-yum Player — timeline, volume, speed, PiP, fullscreen, hotkeys.",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Vokinlemxela/yumyum-player.git",
-    "directory": "packages/ui"
-  },
-  "homepage": "https://github.com/Vokinlemxela/yumyum-player/tree/main/packages/ui#readme",
+  "version": "0.1.0",
+  "author": "Vokinlemxela",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -24,7 +16,6 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
-    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -42,5 +33,13 @@
     "jsdom": "^25.0.1",
     "vitest": "^4.1.8",
     "typescript": "^5.4.5"
-  }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "README.ru.md"
+  ]
 }
