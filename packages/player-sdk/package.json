@@ -1,0 +1,71 @@
+{
+  "name": "@yumyum-player/core",
+  "version": "0.1.0",
+  "description": "Yum-yum Player — Multi-codec browser video player engine. H.264, HEVC/H.265, MJPEG with WebCodecs + WebGL2 rendering.",
+  "license": "MIT",
+  "author": "YumYum",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Vokinlemxela/yumyum-player.git",
+    "directory": "packages/player-sdk"
+  },
+  "homepage": "https://github.com/Vokinlemxela/yumyum-player/tree/main/packages/player-sdk#readme",
+  "bugs": "https://github.com/Vokinlemxela/yumyum-player/issues",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "keywords": [
+    "video-player",
+    "hevc",
+    "h265",
+    "h264",
+    "webcodecs",
+    "webgl",
+    "hls",
+    "mpeg-ts",
+    "mjpeg",
+    "browser-player",
+    "yumyum"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build",
+    "pretypecheck": "node scripts/inline-worker.mjs",
+    "typecheck": "tsc --noEmit",
+    "pretest": "node scripts/inline-worker.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.5",
+    "vitest": "^4.1.8"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

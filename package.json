@@ -1,0 +1,25 @@
+{
+  "name": "yumyum-player",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Yum-yum Player — ultra-low-latency multi-codec video engine for the browser (free MIT core + React UI).",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck",
+    "clean": "turbo run clean"
+  },
+  "devDependencies": {
+    "turbo": "^2.0.0",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "packageManager": "npm@11.3.0"
+}

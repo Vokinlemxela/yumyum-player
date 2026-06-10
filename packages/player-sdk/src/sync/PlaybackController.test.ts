@@ -1,0 +1,135 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { PlaybackController } from './PlaybackController.js';
+import { Logger } from '../utils/Logger.js';
+
+// PlaybackController.start() schedules a tick via requestAnimationFrame, which
+// is absent in the default node test environment. Stub it so it never fires
+// (returns a handle without invoking the callback), keeping the clock static
+// between our explicit performance.now() steps.
+beforeEach(() => {
+  vi.stubGlobal('requestAnimationFrame', () => 1);
+  vi.stubGlobal('cancelAnimationFrame', () => {});
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+const makeController = (audioClock: (() => number | null) | null = null) =>
+  new PlaybackController(audioClock, null, null, null, new Logger('test', 'silent'));
+
+describe('PlaybackController playback rate', () => {
+  it('defaults to 1x', () => {
+    expect(makeController().getPlaybackRate()).toBe(1);
+  });
+
+  it('advances the system clock in real time at 1x', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(1000); // ms
+    const c = makeController();
+    c.start(); // anchors playStartTime = 1.0s, mediaStartClock = 0
+    now.mockReturnValue(3000); // +2s of real time
+    expect(c.getCurrentTime()).toBeCloseTo(2, 6);
+  });
+
+  it('advances twice as fast at 2x', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+    const c = makeController();
+    c.start();
+    c.setPlaybackRate(2);
+    now.mockReturnValue(3000); // +2s real
+    expect(c.getCurrentTime()).toBeCloseTo(4, 6); // scaled 2x
+  });
+
+  it('advances half as fast at 0.5x', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+    const c = makeController();
+    c.start();
+    c.setPlaybackRate(0.5);
+    now.mockReturnValue(3000); // +2s real
+    expect(c.getCurrentTime()).toBeCloseTo(1, 6); // scaled 0.5x
+  });
+
+  it('preserves position when changing rate mid-playback (re-anchor, no jump)', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+    const c = makeController();
+    c.start();
+    now.mockReturnValue(5000); // +4s at 1x → pos 4
+    expect(c.getCurrentTime()).toBeCloseTo(4, 6);
+    c.setPlaybackRate(2); // re-anchor at the current position
+    expect(c.getCurrentTime()).toBeCloseTo(4, 6); // no jump on switch
+    now.mockReturnValue(6000); // +1s real at 2x → +2 → 6
+    expect(c.getCurrentTime()).toBeCloseTo(6, 6);
+  });
+
+  it('uses the audio clock at 1x (once converged) but ignores it at non-1x speed', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+    let audio: number | null = 0.2; // plausible: near the system clock (starts at 0)
+    const c = makeController(() => audio);
+    c.start();
+    expect(c.getCurrentTime()).toBeCloseTo(0.2, 6); // 1x → converged audio clock wins
+    c.setPlaybackRate(1.5); // re-anchors to current pos, then ignores audio
+    audio = 99; // even a bogus audio value is ignored at non-1x
+    expect(c.getCurrentTime()).toBeCloseTo(0.2, 6); // system clock, same instant
+  });
+
+  it('rejects a wildly divergent audio clock instead of jumping to it', () => {
+    // A bad PTS marker / underrun overshoot can momentarily make the audio clock
+    // jump far from the real position. The video clock must not follow it.
+    const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+    let audio: number | null = 0.1; // converged → trusted
+    const c = makeController(() => audio);
+    c.start();
+    expect(c.getCurrentTime()).toBeCloseTo(0.1, 6);
+    now.mockReturnValue(1100); // +0.1s; keep audio converged so it stays trusted
+    audio = 0.2;
+    expect(c.getCurrentTime()).toBeCloseTo(0.2, 6);
+    // Audio clock spikes far ahead (bad marker). Reject it: stay on the smooth
+    // system clock, which is slaved to the last good audio position (0.2).
+    audio = 50;
+    expect(c.getCurrentTime()).toBeCloseTo(0.2, 6);
+  });
+
+  it('holds the last audio position during a brief underrun (no jump)', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+    let audio: number | null = 0.3; // near system (0) → trusted
+    const c = makeController(() => audio);
+    c.start();
+    expect(c.getCurrentTime()).toBeCloseTo(0.3, 6); // lastAudioWall = 1.0s
+    // Underrun: audio clock vanishes. Within the hold window the clock freezes at
+    // the last audio position rather than racing the realtime system clock.
+    audio = null;
+    now.mockReturnValue(1500); // +0.5s into the underrun (< UNDERRUN_HOLD = 1s)
+    expect(c.getCurrentTime()).toBeCloseTo(0.3, 6); // held, not 0.5
+    // After the hold window expires, freewheel on the system clock from the held
+    // position so playback continues even if audio never returns.
+    now.mockReturnValue(2100); // 1.1s after last audio → hold expired, re-anchor at 0.3
+    expect(c.getCurrentTime()).toBeCloseTo(0.3, 6);
+    now.mockReturnValue(2600); // +0.5s of freewheel
+    expect(c.getCurrentTime()).toBeCloseTo(0.8, 6);
+  });
+
+  it('ignores a stale audio clock right after a seek until it reconverges', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+    let audio: number | null = 0.1; // converged before the seek
+    const c = makeController(() => audio);
+    c.start();
+    expect(c.getCurrentTime()).toBeCloseTo(0.1, 6);
+    c.seek(10); // flush → distrust audio; system clock anchored at 10s
+    audio = 99; // stale/old-position audio must be ignored
+    expect(c.getCurrentTime()).toBeCloseTo(10, 6);
+    now.mockReturnValue(1500); // +0.5s real
+    expect(c.getCurrentTime()).toBeCloseTo(10.5, 6); // system clock, not stale audio 99
+    // Once the audio pipeline re-anchors near the new position, trust it again.
+    audio = 10.5;
+    expect(c.getCurrentTime()).toBeCloseTo(10.5, 6);
+  });
+
+  it('rejects non-positive / non-finite rates', () => {
+    const c = makeController();
+    c.setPlaybackRate(0);
+    c.setPlaybackRate(-1);
+    c.setPlaybackRate(NaN);
+    expect(c.getPlaybackRate()).toBe(1);
+  });
+});
