@@ -149,7 +149,19 @@ self.onmessage = (e: MessageEvent) => {
 
     case 'DEMUX':
       try {
-        demuxSegment(data);
+        const uint8 = new Uint8Array(data);
+        let isFmp4 = false;
+        if (uint8.length >= 8) {
+          const type = String.fromCharCode(uint8[4], uint8[5], uint8[6], uint8[7]);
+          if (['ftyp', 'moof', 'mdat', 'styp'].includes(type)) {
+            isFmp4 = true;
+          }
+        }
+        if (isFmp4) {
+          demuxStream(data);
+        } else {
+          demuxSegment(data);
+        }
       } catch (err) {
         logError('Failed to demux segment:', err);
         self.postMessage({ type: 'ERROR', error: err instanceof Error ? err.message : String(err) });

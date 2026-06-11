@@ -35,6 +35,11 @@ export class StreamLoader implements IStreamLoader {
   private targetDuration = 5;
   private isDownloading = false;
   private playlistUrl = '';
+  private isMp4 = false;
+  private mp4Duration = 0;
+  private initSegmentUrl = '';
+  private initSegmentBuffer: ArrayBuffer | null = null;
+  private needSendInit = false;
 
   private activeAbortController: AbortController | null = null;
   private loopTimeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -87,6 +92,24 @@ export class StreamLoader implements IStreamLoader {
     this.pendingRaw = [];
     this.consecutiveFailures = 0;
     this.playlistUrl = url;
+    this.isMp4 = false;
+    this.initSegmentUrl = '';
+    this.initSegmentBuffer = null;
+    this.needSendInit = false;
+
+    // Support progressive MP4/fMP4 streams
+    if (url.endsWith('.mp4') || url.includes('.mp4') || url.includes('/export') || url.includes('format=mp4')) {
+      this.isMp4 = true;
+      this.isLive = false;
+      const u = new URL(url, typeof window !== 'undefined' ? window.location.href : undefined);
+      const durParam = u.searchParams.get('duration');
+      if (durParam) {
+        this.mp4Duration = parseFloat(durParam);
+      }
+      this.segments = [{ url, duration: this.mp4Duration || 300 }];
+      this.logger.debug(`Progressive MP4 stream detected. Target duration: ${this.mp4Duration || 300}s`);
+      return;
+    }
 
     // Support local mock streams directly to guarantee stable test capabilities
     if (url.startsWith('mock://') || url.includes('mock://')) {
@@ -103,7 +126,44 @@ export class StreamLoader implements IStreamLoader {
       const response = await fetch(url, { signal: this.getAbortSignal() });
       if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
       const text = await response.text();
+
+      // Check if it is a master playlist (multivariant)
+      if (text.includes('#EXT-X-STREAM-INF')) {
+        const lines = text.split('\n');
+        const urlWithoutHash = url.split('#')[0].split('?')[0];
+        const baseUrl = urlWithoutHash.substring(0, urlWithoutHash.lastIndexOf('/') + 1);
+        let streamUrl = '';
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (line.startsWith('#EXT-X-STREAM-INF')) {
+            for (let j = i + 1; j < lines.length; j++) {
+              const nextLine = lines[j].trim();
+              if (nextLine && !nextLine.startsWith('#')) {
+                streamUrl = nextLine;
+                break;
+              }
+            }
+            if (streamUrl) break;
+          }
+        }
+        if (streamUrl) {
+          const resolvedUrl = streamUrl.startsWith('http') ? streamUrl : baseUrl + streamUrl;
+          this.logger.debug(`Master playlist detected. Loading media playlist: ${resolvedUrl}`);
+          return this.loadPlaylist(resolvedUrl);
+        }
+        throw new Error('No media playlist found in master playlist.');
+      }
+
       this.parseM3U8(text, url);
+
+      // Download init segment if present
+      if (this.initSegmentUrl) {
+        this.logger.debug(`Loading init segment from: ${this.initSegmentUrl}`);
+        const res = await fetch(this.initSegmentUrl, { signal: this.getAbortSignal() });
+        if (!res.ok) throw new Error(`Failed to load init segment from: ${this.initSegmentUrl}`);
+        this.initSegmentBuffer = await res.arrayBuffer();
+        this.needSendInit = true;
+      }
     } catch (err: unknown) {
       if (err instanceof Error && err.name === 'AbortError') return;
       this.logger.error('Failed to load playlist:', err);
@@ -118,6 +178,7 @@ export class StreamLoader implements IStreamLoader {
     
     let currentDuration = 5;
     const newSegments: Segment[] = [];
+    this.initSegmentUrl = '';
 
     for (let line of lines) {
       line = line.trim();
@@ -125,6 +186,12 @@ export class StreamLoader implements IStreamLoader {
         this.targetDuration = parseInt(line.split(':')[1], 10);
       } else if (line.startsWith('#EXTINF:')) {
         currentDuration = parseFloat(line.split(':')[1].split(',')[0]);
+      } else if (line.startsWith('#EXT-X-MAP:')) {
+        const match = /URI="([^"]+)"/.exec(line);
+        if (match) {
+          const initUrl = match[1];
+          this.initSegmentUrl = initUrl.startsWith('http') ? initUrl : baseUrl + initUrl;
+        }
       } else if (line && !line.startsWith('#')) {
         // Resolve absolute or relative segment URL
         const segmentUrl = line.startsWith('http') ? line : baseUrl + line;
@@ -270,7 +337,9 @@ export class StreamLoader implements IStreamLoader {
       this.loopTimeoutId = setTimeout(() => this.runDownloadLoop(gen), delay);
     };
 
-    if (this.isRawLookaheadEligible()) {
+    if (this.isMp4) {
+      await this.mp4Tick(gen, isBackpressurePaused, scheduleNext);
+    } else if (this.isRawLookaheadEligible()) {
       await this.vodTick(gen, isBackpressurePaused, scheduleNext);
     } else {
       await this.legacyTick(isBackpressurePaused, scheduleNext);
@@ -292,6 +361,12 @@ export class StreamLoader implements IStreamLoader {
     //    raw segment to the demuxer/decoder when the frame queue has drained.
     let didFeed = false;
     if (!isBackpressurePaused() && this.pendingRaw.length > 0) {
+      if (this.needSendInit && this.initSegmentBuffer) {
+        this.logger.debug('Sending HLS fMP4 init segment');
+        this.onSegmentLoaded?.(this.initSegmentBuffer.slice(0));
+        this.needSendInit = false;
+      }
+
       const raw = this.pendingRaw.shift()!;
       this.currentSegmentIndex = raw.index + 1;
       this.onSegmentLoaded?.(raw.buffer);
@@ -314,11 +389,10 @@ export class StreamLoader implements IStreamLoader {
         if (res.ok) {
           buffer = await res.arrayBuffer();
           const uint8 = new Uint8Array(buffer);
-          // MPEG-TS packets must start with the sync byte 0x47
-          if (uint8.length > 0 && uint8[0] === 0x47) {
+          if (this.isValidSegment(uint8)) {
             isValid = true;
           } else {
-            this.logger.warn(`Received invalid MPEG-TS segment (size: ${uint8.length} bytes, sync byte: 0x${uint8[0]?.toString(16) || 'none'}). HTML/404 response suspected.`);
+            this.logger.warn(`Received invalid segment (size: ${uint8.length} bytes, sync byte: 0x${uint8[0]?.toString(16) || 'none'}). HTML/404 response suspected.`);
           }
         }
         if (this.loopGeneration !== gen) return; // seek/stop happened while reading body
@@ -427,15 +501,20 @@ export class StreamLoader implements IStreamLoader {
         if (res.ok) {
           buffer = await res.arrayBuffer();
           const uint8 = new Uint8Array(buffer);
-          // MPEG-TS packets must start with the sync byte 0x47
-          if (uint8.length > 0 && uint8[0] === 0x47) {
+          if (this.isValidSegment(uint8)) {
             isValid = true;
           } else {
-            this.logger.warn(`Received invalid MPEG-TS segment (size: ${uint8.length} bytes, sync byte: 0x${uint8[0]?.toString(16) || 'none'}). HTML/404 response suspected.`);
+            this.logger.warn(`Received invalid segment (size: ${uint8.length} bytes, sync byte: 0x${uint8[0]?.toString(16) || 'none'}). HTML/404 response suspected.`);
           }
         }
 
         if (isValid && buffer) {
+          if (this.needSendInit && this.initSegmentBuffer) {
+            this.logger.debug('Sending HLS fMP4 init segment');
+            this.onSegmentLoaded?.(this.initSegmentBuffer.slice(0));
+            this.needSendInit = false;
+          }
+
           this.onSegmentLoaded?.(buffer);
           this.currentSegmentIndex++;
           this.consecutiveFailures = 0;
@@ -504,6 +583,18 @@ export class StreamLoader implements IStreamLoader {
     this.pendingRaw = [];
     this.consecutiveFailures = 0;
 
+    if (this.isMp4) {
+      this.currentSegmentIndex = 0;
+      this.fetchIndex = 0;
+      this.loopGeneration++;
+      if (this.loopTimeoutId) {
+        clearTimeout(this.loopTimeoutId);
+        this.loopTimeoutId = null;
+      }
+      return true;
+    }
+
+    this.needSendInit = true;
     let accumulatedTime = 0;
     let foundIndex = 0;
 
@@ -564,5 +655,80 @@ export class StreamLoader implements IStreamLoader {
     this.onSegmentLoaded = null;
     this.onMockPacket = null;
     this.onError = null;
+    this.initSegmentBuffer = null;
+  }
+
+  private isValidSegment(uint8: Uint8Array): boolean {
+    if (uint8.length === 0) return false;
+    if (uint8[0] === 0x47) return true;
+    if (uint8.length >= 8) {
+      const type = String.fromCharCode(uint8[4], uint8[5], uint8[6], uint8[7]);
+      if (['ftyp', 'moof', 'mdat', 'styp'].includes(type)) return true;
+    }
+    return false;
+  }
+
+  private async mp4Tick(
+    gen: number,
+    isBackpressurePaused: () => boolean,
+    scheduleNext: (delay: number) => void,
+  ): Promise<void> {
+    if (this.fetchIndex > 0) return;
+    this.fetchIndex = 1;
+
+    try {
+      const res = await fetch(this.playlistUrl, { signal: this.getAbortSignal() });
+      if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+      if (!res.body) throw new Error('No response body');
+
+      const reader = res.body.getReader();
+      
+      const readChunk = async () => {
+        if (!this.isDownloading || this.loopGeneration !== gen) {
+          reader.cancel().catch(() => {});
+          return;
+        }
+
+        if (isBackpressurePaused()) {
+          setTimeout(readChunk, 50);
+          return;
+        }
+
+        try {
+          const { done, value } = await reader.read();
+          if (done) {
+            this.isDownloading = false;
+            this.logger.debug('MP4 progressive download completed (EOF)');
+            return;
+          }
+
+          if (value) {
+            if (this.currentSegmentIndex === 0) {
+              const isValid = this.isValidSegment(value);
+              if (!isValid) {
+                this.logger.warn('Warning: MP4 stream first chunk is not a valid fMP4 container.');
+              }
+            }
+            this.onSegmentLoaded?.(value.buffer);
+            this.currentSegmentIndex++;
+          }
+          readChunk();
+        } catch (err) {
+          this.logger.error('Error reading MP4 stream chunk:', err);
+          this.isDownloading = false;
+          if (this.onError) this.onError(err instanceof Error ? err : new Error(String(err)));
+        }
+      };
+
+      readChunk();
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        this.logger.debug('MP4 fetch aborted successfully.');
+        return;
+      }
+      this.logger.error('Error starting MP4 download:', err);
+      this.isDownloading = false;
+      if (this.onError) this.onError(err instanceof Error ? err : new Error(String(err)));
+    }
   }
 }

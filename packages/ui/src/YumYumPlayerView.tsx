@@ -1,4 +1,6 @@
+"use client";
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Badge } from './index.js';
 
 // ====================================================================
 // YumYumPlayerView — reusable, YouTube-style chrome around a YumYumPlayer
@@ -64,6 +66,9 @@ export interface YumYumPlayerViewProps {
   persistKeyPrefix?: string;
   lang?: 'ru' | 'en';
   className?: string;
+  overlayTopLeft?: React.ReactNode;
+  overlayTopRight?: React.ReactNode;
+  badges?: { label: string; variant?: 'rec' | 'primary' | 'warning' | 'neutral' }[];
 }
 
 const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
@@ -119,7 +124,9 @@ const STYLE = `
 .yyv-spin{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;z-index:10}
 .yyv-spin svg{animation:yyv-rot 1s linear infinite;height:48px;width:48px}
 @keyframes yyv-rot{to{transform:rotate(360deg)}}
-.yyv-error{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#f87171;font:13px ui-monospace,monospace;z-index:20}
+.yyv-error{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#f87171;font:13px ui-monospace,monospace;z-index:20;pointer-events:none}
+.yyv-overlay-tl{position:absolute;top:8px;left:8px;z-index:50;display:flex;gap:6px;pointer-events:auto}
+.yyv-overlay-tr{position:absolute;top:8px;right:8px;z-index:50;display:flex;gap:6px;pointer-events:auto}
 .yyv-bar{position:absolute;left:0;right:0;bottom:0;z-index:30;padding:36px 12px 10px;background:linear-gradient(to top,rgba(0,0,0,.9),rgba(0,0,0,.45) 55%,transparent);transition:opacity .2s;color:#fff}
 .yyv-bar.yyv-hidden{opacity:0;pointer-events:none}
 .yyv-row{display:flex;align-items:center;gap:14px}
@@ -250,6 +257,9 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
   persistKeyPrefix = 'yumyum',
   lang = 'en',
   className = '',
+  overlayTopLeft,
+  overlayTopRight,
+  badges,
 }) => {
   const show = (k: PlayerControlKey) => controls?.[k] !== false;
   const t = STRINGS[lang];
@@ -581,6 +591,21 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
 
       {/* Off-screen video used only as a PiP surface for the canvas stream */}
       <video ref={pipVideoRef} muted playsInline className="yyv-pipvideo" />
+
+      {((badges && badges.length > 0) || overlayTopLeft) && (
+        <div className="yyv-overlay-tl">
+          {badges?.map((b, i) => (
+            <Badge key={i} label={b.label} variant={b.variant} />
+          ))}
+          {overlayTopLeft}
+        </div>
+      )}
+
+      {overlayTopRight && (
+        <div className="yyv-overlay-tr">
+          {overlayTopRight}
+        </div>
+      )}
 
       {isBuffering && !hasError && (
         <div className="yyv-spin" style={{ color: accentColor }}>

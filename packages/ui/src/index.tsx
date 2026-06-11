@@ -1,29 +1,79 @@
-import React, { useRef } from 'react';
+"use client";
+import React, { useEffect, useRef } from 'react';
 
 // Full YouTube-style player chrome (timeline, volume, speed, autoplay, PiP, fullscreen).
 export { YumYumPlayerView } from './YumYumPlayerView.js';
 export type { YumYumPlayerViewProps, PlayerHandle, PlayerControlKey } from './YumYumPlayerView.js';
 
+const STYLE_ID = 'yyp-primitives-styles';
+const STYLE = `
+.yyp-badge{display:inline-flex;align-items:center;padding:2px 6px;border-radius:3px;font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;border:1px solid}
+.yyp-badge-primary{background:rgba(0,255,102,.06);color:var(--yyp-accent,#00ff66);border-color:rgba(0,255,102,.3)}
+.yyp-badge-warning{background:rgba(255,173,0,.08);color:var(--yyp-warning,#ffad00);border-color:rgba(255,173,0,.35)}
+.yyp-badge-neutral{background:var(--yyp-surface,#0a0a0a);color:var(--yyp-text-secondary,#a0a0a0);border-color:var(--yyp-border,#1a1a1a)}
+.yyp-badge-rec{background:rgba(255,69,58,.08);color:#ff453a;border-color:rgba(255,69,58,.4);animation:yyp-pulse 1.4s infinite}
+
+.yyp-btn{display:inline-flex;align-items:center;justify-content:center;border-radius:4px;border:1px solid;cursor:pointer;font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;transition:all .2s;color:var(--yyp-text,#fff)}
+.yyp-btn-default{background:var(--yyp-surface,#0a0a0a);border-color:var(--yyp-border,#1a1a1a)}
+.yyp-btn-default:hover{background:var(--yyp-surface-hover,#121212);border-color:rgba(160,160,160,.3)}
+.yyp-btn-active{background:rgba(0,255,102,.05);border-color:var(--yyp-accent,#00ff66);color:var(--yyp-accent,#00ff66);box-shadow:0 0 8px rgba(0,255,102,.1)}
+.yyp-btn-ghost{border:none;background:transparent;padding:0;height:auto}
+.yyp-btn-ghost:hover{background:rgba(255,255,255,.05)}
+.yyp-btn:active{transform:scale(.95)}
+
+.yyp-input{background:#000;border:1px solid var(--yyp-border,#1a1a1a);border-radius:4px;padding:8px 10px;color:#fff;font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:10px;outline:none;transition:border-color .15s}
+.yyp-input:focus{border-color:var(--yyp-accent,#00ff66)}
+.yyp-input::placeholder{color:rgba(160,160,160,.45)}
+
+.yyp-select{background:#000;border:1px solid var(--yyp-border,#1a1a1a);border-radius:4px;padding:6px 8px;color:#fff;font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:10px;outline:none;transition:border-color .15s}
+.yyp-select:focus{border-color:var(--yyp-accent,#00ff66)}
+
+.yyp-slider{position:relative;height:6px;width:100%;background:rgba(255,255,255,.15);border-radius:999px;cursor:pointer;overflow:hidden;outline:none;user-select:none}
+.yyp-slider-fill{position:absolute;height:100%;left:0;top:0;background:var(--yyp-accent,#00ff66);transition:background-color .15s}
+.yyp-slider-handle{position:absolute;top:50%;transform:translate(-50%,-50%);height:10px;width:10px;border-radius:50%;background:#fff;border:1px solid var(--yyp-accent,#00ff66);box-shadow:0 0 3px rgba(0,0,0,.5);opacity:0;transition:opacity .15s}
+.yyp-slider:hover .yyp-slider-handle,.yyp-slider:focus-visible .yyp-slider-handle{opacity:1}
+
+.yyp-spinner{display:inline-flex;align-items:center;justify-content:center;pointer-events:none}
+.yyp-spinner-svg{animation:yyp-rot 1s linear infinite;height:40px;width:40px;color:var(--yyp-accent,#00ff66)}
+
+@keyframes yyp-rot{to{transform:rotate(360deg)}}
+@keyframes yyp-pulse{0%,100%{opacity:1}50%{opacity:.3}}
+`;
+
+function ensureStyles(): void {
+  if (typeof document === 'undefined' || document.getElementById(STYLE_ID)) return;
+  const el = document.createElement('style');
+  el.id = STYLE_ID;
+  el.textContent = STYLE;
+  document.head.appendChild(el);
+}
+
 // ==================== PREMIUM BADGE ====================
 export interface BadgeProps {
   label: string;
-  variant?: 'primary' | 'warning' | 'neutral';
+  variant?: 'primary' | 'warning' | 'neutral' | 'rec';
 }
 
 export const Badge: React.FC<BadgeProps> = ({ label, variant = 'neutral' }) => {
-  const getStyles = () => {
+  useEffect(() => {
+    ensureStyles();
+  }, []);
+
+  const getVariantClass = () => {
     switch (variant) {
       case 'primary':
-        return 'bg-accent-primary/10 text-accent-primary border-accent-primary/30';
+        return 'yyp-badge-primary';
       case 'warning':
-        return 'bg-accent-warning/10 text-accent-warning border-accent-warning/30';
+        return 'yyp-badge-warning';
+      case 'rec':
+        return 'yyp-badge-rec';
       default:
-        return 'bg-surface text-text-secondary border-border-elite';
+        return 'yyp-badge-neutral';
     }
   };
 
   return (
-    <span className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-bold tracking-wider uppercase border ${getStyles()}`}>
+    <span className={`yyp-badge ${getVariantClass()}`}>
       {label}
     </span>
   );
@@ -36,20 +86,20 @@ export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElemen
 }
 
 export const Button: React.FC<ButtonProps> = ({ children, active, variant = 'default', className = '', ...props }) => {
-  const getStyles = () => {
+  useEffect(() => {
+    ensureStyles();
+  }, []);
+
+  const getVariantClass = () => {
     if (variant === 'ghost') {
-      return 'border-0 bg-transparent hover:bg-white/5';
+      return 'yyp-btn-ghost';
     }
-    return active 
-      ? 'p-2 border border-accent-primary bg-accent-primary/5 text-accent-primary shadow-[0_0_8px_rgba(0,255,102,0.1)]' 
-      : 'p-2 border hover:bg-surface-hover hover:border-text-secondary/30 bg-surface border-border-elite';
+    return active ? 'yyp-btn-active' : 'yyp-btn-default';
   };
 
   return (
     <button
-      className={`flex items-center justify-center rounded transition-all duration-200 cursor-pointer text-text-primary
-        ${getStyles()}
-        ${className}`}
+      className={`yyp-btn ${getVariantClass()} ${className}`}
       aria-pressed={active}
       {...props}
     >
@@ -69,6 +119,10 @@ export interface SliderProps {
 export const Slider: React.FC<SliderProps> = ({ value, onChange, className = '' }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const isDragging = useRef(false);
+
+  useEffect(() => {
+    ensureStyles();
+  }, []);
 
   const handlePointerDown = (e: React.PointerEvent) => {
     if (!containerRef.current) return;
@@ -133,34 +187,30 @@ export const Slider: React.FC<SliderProps> = ({ value, onChange, className = '' 
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuenow={Math.round(value)}
-      className={`relative h-1.5 w-full bg-border-elite/60 rounded-full cursor-pointer overflow-hidden group select-none focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background ${className}`}
+      className={`yyp-slider ${className}`}
     >
-      {/* Elapsed Fill */}
-      <div
-        className="absolute h-full left-0 top-0 bg-accent-primary group-hover:bg-accent-primary/90 transition-colors"
-        style={{ width: `${value}%` }}
-      />
-      {/* Handle */}
-      <div
-        className="absolute top-1/2 -translate-y-1/2 h-3 w-3 rounded-full bg-text-primary border border-accent-primary shadow opacity-0 group-hover:opacity-100 transition-opacity"
-        style={{ left: `calc(${value}% - 6px)` }}
-      />
+      <div className="yyp-slider-fill" style={{ width: `${value}%` }} />
+      <div className="yyp-slider-handle" style={{ left: `calc(${value}% - 5px)` }} />
     </div>
   );
 };
 
 // ==================== BUFFERING SPINNER ====================
 export const Spinner: React.FC = () => {
+  useEffect(() => {
+    ensureStyles();
+  }, []);
+
   return (
-    <div className="flex items-center justify-center pointer-events-none" role="status" aria-label="Loading...">
+    <div className="yyp-spinner" role="status" aria-label="Loading...">
       <svg
-        className="animate-spin h-10 w-10 text-accent-primary"
+        className="yyp-spinner-svg"
         xmlns="http://www.w3.org/2000/svg"
         fill="none"
         viewBox="0 0 24 24"
       >
         <circle
-          className="opacity-25"
+          style={{ opacity: 0.25 }}
           cx="12"
           cy="12"
           r="10"
@@ -168,7 +218,7 @@ export const Spinner: React.FC = () => {
           strokeWidth="3"
         />
         <path
-          className="opacity-75"
+          style={{ opacity: 0.75 }}
           fill="currentColor"
           d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
         />
@@ -181,9 +231,13 @@ export const Spinner: React.FC = () => {
 export interface InputProps extends React.InputHTMLAttributes<HTMLInputElement> {}
 
 export const Input: React.FC<InputProps> = ({ className = '', ...props }) => {
+  useEffect(() => {
+    ensureStyles();
+  }, []);
+
   return (
     <input
-      className={`bg-black border border-border-elite rounded px-3 py-2 text-[10px] font-mono text-white focus:outline-none focus:border-accent-primary transition-all ${className}`}
+      className={`yyp-input ${className}`}
       {...props}
     />
   );
@@ -193,13 +247,16 @@ export const Input: React.FC<InputProps> = ({ className = '', ...props }) => {
 export interface SelectProps extends React.SelectHTMLAttributes<HTMLSelectElement> {}
 
 export const Select: React.FC<SelectProps> = ({ children, className = '', ...props }) => {
+  useEffect(() => {
+    ensureStyles();
+  }, []);
+
   return (
     <select
-      className={`bg-black border border-border-elite rounded px-2 py-1.5 text-[10px] font-mono text-white focus:outline-none transition-all ${className}`}
+      className={`yyp-select ${className}`}
       {...props}
     >
       {children}
     </select>
   );
 };
-
