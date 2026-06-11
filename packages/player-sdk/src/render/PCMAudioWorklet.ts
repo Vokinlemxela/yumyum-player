@@ -475,10 +475,15 @@ export class PCMAudioWorklet {
       await this.initialize(this.lastSeenSampleRate);
     }
 
-    // 4. Await the resumption promise if it was created
+    // 4. Handle the resumption promise asynchronously without blocking player startup
     if (resumePromise) {
-      await resumePromise;
-      this.logger.debug(`AudioContext resumed successfully. State: ${this.audioCtx?.state}`);
+      resumePromise
+        .then(() => {
+          this.logger.debug(`AudioContext resumed successfully. State: ${this.audioCtx?.state}`);
+        })
+        .catch((err) => {
+          this.logger.warn('AudioContext resume failed or was blocked:', err);
+        });
     }
   }
 

@@ -1,6 +1,6 @@
 "use client";
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Badge } from './index.js';
+import { Badge, Button, Slider, Spinner } from './index.js';
 
 // ====================================================================
 // YumYumPlayerView — reusable, YouTube-style chrome around a YumYumPlayer
@@ -112,7 +112,7 @@ const STYLE_ID = 'yyv-styles';
 const STYLE = `
 .yyv-root{position:relative;width:100%;height:100%;background:#000;overflow:hidden;user-select:none;outline:none;font-family:ui-sans-serif,system-ui,sans-serif}
 .yyv-root.yyv-nocursor{cursor:none}
-.yyv-canvas{position:relative;z-index:1;width:100%;height:100%;object-fit:contain;display:block}
+.yyv-canvas{position:relative;z-index:1;width:100%;height:100%;object-fit:contain;display:block;background:#000}
 /* PiP mirror: a REAL, full-size <video> painted *behind* the canvas. It must
    not be 1px / opacity:0 — browsers suspend frame production for effectively
    invisible videos, so requestPictureInPicture() then resolves but opens an
@@ -284,6 +284,7 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLive, setIsLive] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
+  const [isReady, setIsReady] = useState(false);
   const [hasError, setHasError] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -301,6 +302,7 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
   // ── Player lifecycle ──────────────────────────────────────────────
   useEffect(() => {
     if (!canvasRef.current) return;
+    setIsReady(false);
     let mounted = true;
     let poll: ReturnType<typeof setInterval> | null = null;
     let created: PlayerHandle | null = null;
@@ -331,6 +333,7 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
 
         player.on('ended', onEnded);
         player.on('error', () => { if (mounted) setHasError(true); });
+        if (mounted) setIsReady(true);
 
         if (live || autoplay) {
           player.play().then(() => { if (mounted) setIsPlaying(true); }).catch(() => {});
@@ -607,19 +610,16 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
         </div>
       )}
 
-      {isBuffering && !hasError && (
+      {(!isReady || isBuffering) && !hasError && (
         <div className="yyv-spin" style={{ color: accentColor }}>
-          <svg viewBox="0 0 24 24" fill="none">
-            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" style={{ opacity: 0.25 }} />
-            <path fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" style={{ opacity: 0.75 }} />
-          </svg>
+          <Spinner />
         </div>
       )}
 
-      {!isPlaying && !isBuffering && !hasError && (
-        <button className="yyv-center" onClick={togglePlay} aria-label="Play" style={{ color: accentColor }}>
+      {isReady && !isPlaying && !isBuffering && !hasError && (
+        <Button variant="ghost" className="yyv-center" onClick={togglePlay} aria-label="Play" style={{ color: accentColor }}>
           <span style={{ display: 'flex', transform: 'scale(1.4)' }}><PlayIcon /></span>
-        </button>
+        </Button>
       )}
 
       {hasError && <div className="yyv-error">Playback error</div>}
@@ -649,22 +649,20 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
 
         <div className="yyv-row">
           {show('play') && (
-            <button className="yyv-btn" onClick={togglePlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
+            <Button variant="ghost" className="yyv-btn" onClick={togglePlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
               {isPlaying ? <PauseIcon /> : <PlayIcon />}
-            </button>
+            </Button>
           )}
 
           {show('volume') && (
             <div className="yyv-vol">
-              <button className="yyv-btn" onClick={toggleMute} aria-label={muted ? 'Unmute' : 'Mute'}>
+              <Button variant="ghost" className="yyv-btn" onClick={toggleMute} aria-label={muted ? 'Unmute' : 'Mute'}>
                 {muted ? <VolumeMuteIcon /> : <VolumeHighIcon />}
-              </button>
-              <input
-                type="range" min={0} max={100} value={volPct}
-                onChange={(e) => applyVolume(Number(e.target.value) / 100)}
-                aria-label="Volume"
+              </Button>
+              <Slider
+                value={volPct}
+                onChange={(val) => applyVolume(val / 100)}
                 className="yyv-volrange"
-                style={{ accentColor }}
               />
             </div>
           )}
@@ -683,14 +681,15 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
 
           {show('settings') && (
             <div style={{ position: 'relative' }}>
-              <button
+              <Button
+                variant="ghost"
                 className="yyv-btn"
                 onClick={() => { setSettingsOpen((s) => !s); revealControls(); }}
                 aria-label={t.settings}
                 style={{ transform: settingsOpen ? 'rotate(45deg)' : undefined }}
               >
                 <GearIcon />
-              </button>
+              </Button>
               {settingsOpen && (
                 <SettingsMenu
                   lang={lang}
@@ -707,15 +706,15 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
           )}
 
           {show('pip') && pipSupported && (
-            <button className="yyv-btn" onClick={togglePip} aria-label="Picture in picture">
+            <Button variant="ghost" className="yyv-btn" onClick={togglePip} aria-label="Picture in picture">
               <PipIcon />
-            </button>
+            </Button>
           )}
 
           {show('fullscreen') && (
-            <button className="yyv-btn" onClick={toggleFullscreen} aria-label="Fullscreen">
+            <Button variant="ghost" className="yyv-btn" onClick={toggleFullscreen} aria-label="Fullscreen">
               {isFullscreen ? <FullscreenExitIcon /> : <FullscreenIcon />}
-            </button>
+            </Button>
           )}
         </div>
       </div>
@@ -730,9 +729,9 @@ const SpeedQuick: React.FC<{ rate: number; accent: string; onPick: (r: number) =
     onPick(PLAYBACK_RATES[(i + 1) % PLAYBACK_RATES.length]);
   };
   return (
-    <button className="yyv-btn" onClick={next} style={{ font: '700 12px/1 ui-monospace,monospace', color: rate !== 1 ? accent : '#fff' }}>
+    <Button variant="ghost" className="yyv-btn" onClick={next} style={{ font: '700 12px/1 ui-monospace,monospace', color: rate !== 1 ? accent : '#fff' }}>
       {rate}×
-    </button>
+    </Button>
   );
 };
 
@@ -748,10 +747,10 @@ const SettingsMenu: React.FC<{
 }> = ({ lang, accent, rate, autoplay, loop, onRate, onAutoplay, onLoop }) => {
   const t = STRINGS[lang];
   const Toggle: React.FC<{ label: string; on: boolean; onClick: () => void }> = ({ label, on, onClick }) => (
-    <button className="yyv-mi" onClick={onClick}>
+    <Button variant="ghost" className="yyv-mi" onClick={onClick}>
       <span>{label}</span>
       <span style={{ fontWeight: 700, fontSize: 10, color: on ? accent : '#888' }}>{on ? t.on : t.off}</span>
-    </button>
+    </Button>
   );
   return (
     <div className="yyv-menu">
@@ -760,10 +759,10 @@ const SettingsMenu: React.FC<{
       <div className="yyv-sep" />
       <div className="yyv-mlabel">{t.speed}</div>
       {PLAYBACK_RATES.map((r) => (
-        <button key={r} className="yyv-mi" onClick={() => onRate(r)}>
+        <Button key={r} variant="ghost" className="yyv-mi" onClick={() => onRate(r)}>
           <span>{r === 1 ? t.normal : `${r}×`}</span>
           {rate === r && <span style={{ color: accent, display: 'flex' }}><CheckIcon /></span>}
-        </button>
+        </Button>
       ))}
     </div>
   );
