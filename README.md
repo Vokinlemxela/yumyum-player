@@ -4,6 +4,8 @@
 
 > Ultra-low-latency, multi-codec video engine for the browser.
 > Hardware decoding (WebCodecs) + WebGL2 rendering, with a plugin seam for extensions.
+>
+> Website: **[yumyum.video](https://yumyum.video)**
 
 **Yum-yum Player** plays video using the browser's own hardware decoders and
 renders straight to a `<canvas>` with WebGL2. It handles **HLS** out of the box,
