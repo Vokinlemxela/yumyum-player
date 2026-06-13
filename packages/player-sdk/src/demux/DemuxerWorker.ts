@@ -93,6 +93,7 @@ let isFMP4Stream: boolean | null = null;
 let currentAVCC: Uint8Array | null = null;
 let currentHVCC: Uint8Array | null = null;
 let currentParsedCodec: string | undefined = undefined;
+let fmp4TimelineOffset: number | null = null;
 
 interface FragmentTrackSamples {
   trackId: number;
@@ -139,6 +140,7 @@ self.onmessage = (e: MessageEvent) => {
       currentAVCC = null;
       currentHVCC = null;
       currentParsedCodec = undefined;
+      fmp4TimelineOffset = null;
       trackTypes.clear();
       trackTimescales.clear();
       audioConfig = null;
@@ -197,6 +199,7 @@ self.onmessage = (e: MessageEvent) => {
       streamBuffer = new Uint8Array(0);
       currentParsedCodec = undefined;
       currentFragmentSamples = [];
+      fmp4TimelineOffset = null;
       logDebug('Flushed timelines and streaming buffers');
       break;
   }
@@ -914,6 +917,7 @@ function deliverFMP4Audio(aac: Uint8Array, ptsSeconds: number) {
 function processFMP4Box(type: string, boxData: Uint8Array) {
   if (type === 'moov') {
     logWarn('Processing moov box');
+    fmp4TimelineOffset = null;
     
     // Parse track types, per-track timescales, and the audio AAC config.
     trackTypes.clear();
@@ -1049,7 +1053,13 @@ function processFMP4Box(type: string, boxData: Uint8Array) {
           }
 
           const sampleData = boxData.subarray(mdatOffset, mdatOffset + sampleSize);
-          const ptsSeconds = (dtsTicks + sample.compositionOffset) / timescale;
+          let ptsSeconds = (dtsTicks + sample.compositionOffset) / timescale;
+
+          if (fmp4TimelineOffset === null) {
+            fmp4TimelineOffset = ptsSeconds;
+            logWarn(`Established fMP4 timeline offset: ${fmp4TimelineOffset}s`);
+          }
+          ptsSeconds -= fmp4TimelineOffset;
 
           if (trackFrag.type === 'video') {
             const isKey = detectFMP4Keyframe(sampleData);

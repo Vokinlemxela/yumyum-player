@@ -65,7 +65,7 @@ export class StreamLoader implements IStreamLoader {
   private logger: Logger;
 
   constructor(deps: LoaderDeps) {
-    this.onSegmentLoaded = (buffer) => deps.onData(buffer, false);
+    this.onSegmentLoaded = (buffer) => deps.onData(buffer, this.isMp4);
     this.onMockPacket = deps.onMockPacket;
     this.onError = deps.onError;
     this.logger = deps.logger;

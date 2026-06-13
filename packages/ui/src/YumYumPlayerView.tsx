@@ -74,9 +74,14 @@ export interface YumYumPlayerViewProps {
 const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 
 const STRINGS = {
-  ru: { speed: 'Скорость', normal: 'Обычная', autoplay: 'Автовоспроизведение', loop: 'Повтор', live: 'В ЭФИРЕ', settings: 'Настройки', on: 'Вкл', off: 'Выкл' },
-  en: { speed: 'Speed', normal: 'Normal', autoplay: 'Autoplay', loop: 'Loop', live: 'LIVE', settings: 'Settings', on: 'On', off: 'Off' },
+  ru: { speed: 'Скорость', normal: 'Обычная', autoplay: 'Автовоспроизведение', loop: 'Повтор', live: 'В ЭФИРЕ', settings: 'Настройки', on: 'Вкл', off: 'Выкл', noVideo: 'Видео отсутствует' },
+  en: { speed: 'Speed', normal: 'Normal', autoplay: 'Autoplay', loop: 'Loop', live: 'LIVE', settings: 'Settings', on: 'On', off: 'Off', noVideo: 'No video' },
 };
+
+// Затяжной сталл (тиков по 250мс), после которого вместо крутящегося лоадера
+// показываем заглушку «Видео отсутствует»: данных явно нет (дыра в записи,
+// пропавший сигнал), а не короткая буферизация.
+const SIGNAL_LOST_TICKS = 20; // ~5 секунд
 
 function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
@@ -125,6 +130,7 @@ const STYLE = `
 .yyv-spin svg{animation:yyv-rot 1s linear infinite;height:48px;width:48px}
 @keyframes yyv-rot{to{transform:rotate(360deg)}}
 .yyv-error{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#f87171;font:13px ui-monospace,monospace;z-index:20;pointer-events:none}
+.yyv-novideo{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#000;color:#8b8b93;font:600 13px ui-monospace,monospace;letter-spacing:.1em;text-transform:uppercase;z-index:15;pointer-events:none}
 .yyv-overlay-tl{position:absolute;top:8px;left:8px;z-index:50;display:flex;gap:6px;pointer-events:auto}
 .yyv-overlay-tr{position:absolute;top:8px;right:8px;z-index:50;display:flex;gap:6px;pointer-events:auto}
 .yyv-bar{position:absolute;left:0;right:0;bottom:0;z-index:30;padding:36px 12px 10px;background:linear-gradient(to top,rgba(0,0,0,.9),rgba(0,0,0,.45) 55%,transparent);transition:opacity .2s;color:#fff}
@@ -284,6 +290,7 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLive, setIsLive] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
+  const [signalLost, setSignalLost] = useState(false);
   const [isReady, setIsReady] = useState(false);
   const [hasError, setHasError] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -354,7 +361,11 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
           const tickStalled = playing && tel.renderedFrames === lastFrames
             && tel.queueLength === 0 && tel.activeCodec !== 'mjpeg';
           stallTicks = tickStalled ? stallTicks + 1 : 0;
-          setIsBuffering(stallTicks >= 3);
+          // Короткий сталл — спиннер (буферизация); затяжной — заглушка
+          // «видео отсутствует» (данных нет: дыра в записи / потерян сигнал).
+          const lost = stallTicks >= SIGNAL_LOST_TICKS;
+          setSignalLost(lost);
+          setIsBuffering(stallTicks >= 3 && !lost);
           lastFrames = tel.renderedFrames;
 
           // Eagerly mirror the canvas into the off-screen PiP <video> once frames
@@ -620,6 +631,10 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
         <Button variant="ghost" className="yyv-center" onClick={togglePlay} aria-label="Play" style={{ color: accentColor }}>
           <span style={{ display: 'flex', transform: 'scale(1.4)' }}><PlayIcon /></span>
         </Button>
+      )}
+
+      {signalLost && !hasError && (
+        <div className="yyv-novideo">{t.noVideo}</div>
       )}
 
       {hasError && <div className="yyv-error">Playback error</div>}

@@ -20,6 +20,15 @@ export class PlaybackController {
   private lastRenderedPTS = -1;
   private droppedFramesCount = 0;
   private renderedFramesCount = 0;
+  /**
+   * Target media position (s) of an in-progress seek, or null. After a seek the
+   * demuxer re-emits from the keyframe before the target, so frames arrive
+   * starting below the requested time. Until the target frame is decoded we pin
+   * the clock to the target and discard the pre-roll — otherwise the lazy
+   * alignment in tick() would anchor the clock to the first decoded frame and
+   * playback would jump back to the start (the classic "seek resets to 0" bug).
+   */
+  private seekTarget: number | null = null;
 
   // Timings
   public duration = Infinity; // Total media duration to auto-pause at the end
@@ -70,11 +79,16 @@ export class PlaybackController {
 
   public enqueueFrame(frame: DecodedFrame) {
     this.enqueueCount++;
-    this.frameQueue.push(frame);
     
-    // if (this.enqueueCount % 60 === 1) {
-    //   console.log(`[PlaybackController] enqueueFrame #${this.enqueueCount} | Frame PTS: ${frame.pts}s | Queue Length: ${this.frameQueue.length}`);
-    // }
+    // Insert frame in ascending PTS order to support B-frame reordering
+    let insertIdx = this.frameQueue.length;
+    for (let i = this.frameQueue.length - 1; i >= 0; i--) {
+      if (this.frameQueue[i].pts <= frame.pts) {
+        break;
+      }
+      insertIdx = i;
+    }
+    this.frameQueue.splice(insertIdx, 0, frame);
 
     // Check backpressure
     this.checkBackpressure();
@@ -115,6 +129,7 @@ export class PlaybackController {
     this.flush();
     this.mediaStartClock = pts;
     this.playStartTime = performance.now() / 1000;
+    this.seekTarget = pts;
 
     const audioTime = this.getAudioClock ? this.getAudioClock() : null;
     this.audioCtxStartOffset = audioTime;
@@ -311,6 +326,35 @@ export class PlaybackController {
         // Re-read current clock after timeline alignment
         currentClock = this.getCurrentTime();
       }
+    }
+
+    // Post-seek landing: drop pre-roll frames (decoded from the keyframe before
+    // the target) and keep the clock pinned to the target until the target frame
+    // is decoded. This must run before the lazy alignment below, which would
+    // otherwise anchor the clock to the first decoded frame (≈0) and undo the seek.
+    if (this.seekTarget !== null && this.lastRenderedPTS === -1) {
+      while (this.frameQueue.length > 0 && this.frameQueue[0].pts < this.seekTarget) {
+        const stale = this.frameQueue.shift()!;
+        if (stale.data && 'close' in stale.data) {
+          try {
+            stale.data.close();
+          } catch (err) {
+            this.logger.error('Error closing pre-seek VideoFrame:', err);
+          }
+        }
+        this.droppedFramesCount++;
+      }
+      if (this.frameQueue.length === 0) {
+        // Target frame not decoded yet — hold the clock at the target so it
+        // can't race ahead, and wait for the next decoded batch.
+        this.mediaStartClock = this.seekTarget;
+        this.playStartTime = performance.now() / 1000;
+        this.scheduleTick();
+        return;
+      }
+      // Target frame available — clear seek state; the lazy alignment anchors
+      // the clock to it (its pts is ≥ target, ≈ the requested position).
+      this.seekTarget = null;
     }
 
     // Lazy timing alignment on the very first frame processed

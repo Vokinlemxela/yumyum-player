@@ -74,6 +74,8 @@ export interface PlayerTelemetry {
   decodingStrategy: string;
   /** Current playback speed multiplier (1 = normal). */
   playbackRate: number;
+  /** Message of the last encountered error, if any. */
+  lastError?: string;
 }
 
 export type PlayerEvent = 'play' | 'pause' | 'error' | 'ended';
@@ -112,6 +114,7 @@ export class YumYumPlayer {
   private userMuted = false;
 
   private lifecycleState: PlayerLifecycleState = 'IDLE';
+  private lastError: Error | null = null;
 
   /** Get the current player lifecycle state */
   public get state(): PlayerLifecycleState {
@@ -151,6 +154,10 @@ export class YumYumPlayer {
 
   /** Emit a player event */
   private emit(event: PlayerEvent, ...args: unknown[]): void {
+    if (event === 'error') {
+      const err = args[0];
+      this.lastError = err instanceof Error ? err : new Error(String(err));
+    }
     this.listeners.get(event)?.forEach(cb => cb(...args));
   }
 
@@ -326,6 +333,7 @@ export class YumYumPlayer {
 
     this.logger.info(`Loading stream from: ${url} (Current state: ${this.lifecycleState})`);
     this.lifecycleState = 'LOADING';
+    this.lastError = null;
 
     try {
       this.playbackController.flush();
@@ -413,6 +421,11 @@ export class YumYumPlayer {
       this.worker.onmessage = (e: MessageEvent) => {
         try {
           const { type, codec, pts, data, isKeyframe } = e.data;
+
+          if (type === 'ERROR') {
+            this.emit('error', new Error(e.data.error || 'Unknown demuxer worker error'));
+            return;
+          }
 
           if (type === 'VIDEO') {
             const decoder = this.decoders.get(codec);
@@ -609,6 +622,7 @@ export class YumYumPlayer {
           : this.activeCodec === 'mjpeg'
           ? 'ImageBitmap (CPU)'
           : 'WebCodecs (GPU)',
+      lastError: this.lastError ? this.lastError.message : undefined,
     };
   }
 

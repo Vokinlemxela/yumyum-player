@@ -199,7 +199,7 @@ export abstract class BaseVideoDecoder implements IBaseDecoder {
       },
       error: (e) => {
         this.logger.error(`${outputLogTag} Native VideoDecoder error:`, e);
-        this.attemptRecovery();
+        this.attemptRecovery(e);
       },
     });
 
@@ -221,11 +221,11 @@ export abstract class BaseVideoDecoder implements IBaseDecoder {
       this.logger.debug(`${this.currentCodec} Native decoder configured successfully | desc: ${this.currentDescription ? 'yes' : 'no'}`);
     } catch (err) {
       this.logger.error(`Failed to configure decoder with codec ${this.currentCodec}:`, err);
-      this.attemptRecovery();
+      this.attemptRecovery(err);
     }
   }
 
-  protected abstract attemptRecovery(): void;
+  protected abstract attemptRecovery(error?: any): void;
 
   public flush() {
     this.hasDecodedFirstKeyframe = false;
@@ -268,7 +268,7 @@ export class H264Decoder extends BaseVideoDecoder {
     return !this.hasWebCodecsSupport || this.recoveryAttempts > this.MAX_RECOVERY_ATTEMPTS;
   }
 
-  protected attemptRecovery() {
+  protected attemptRecovery(error?: any) {
     if (this.isDestroyed) return;
     this.recoveryAttempts++;
 
@@ -277,7 +277,7 @@ export class H264Decoder extends BaseVideoDecoder {
 
     if (this.recoveryAttempts > this.MAX_RECOVERY_ATTEMPTS) {
       this.logger.error('Max recovery attempts reached. Native decoder disabled.');
-      this.onError(new Error('Stream error — reload required'));
+      this.onError(new Error(`Native H264 decoder permanently failed: ${error?.message || error || 'Max recovery attempts reached'}`));
       return;
     }
 
@@ -386,7 +386,7 @@ export class H264Decoder extends BaseVideoDecoder {
       this.decoder.decode(chunk);
     } catch (err) {
       this.logger.warn('Native decode error, attempting recovery:', err);
-      this.attemptRecovery();
+      this.attemptRecovery(err);
     }
   }
 }
@@ -461,7 +461,7 @@ export class HEVCDecoder extends BaseVideoDecoder {
     }
   }
 
-  protected attemptRecovery() {
+  protected attemptRecovery(error?: any) {
     if (this.isDestroyed) return;
     this.recoveryAttempts++;
 
@@ -470,7 +470,7 @@ export class HEVCDecoder extends BaseVideoDecoder {
 
     if (this.recoveryAttempts > this.MAX_RECOVERY_ATTEMPTS) {
       this.logger.error('Max recovery attempts reached. Native decoder disabled.');
-      this.onError(new Error('Stream error — reload required'));
+      this.onError(new Error(`Native HEVC decoder permanently failed: ${error?.message || error || 'Max recovery attempts reached'}`));
       return;
     }
 
@@ -578,7 +578,7 @@ export class HEVCDecoder extends BaseVideoDecoder {
       this.decoder.decode(chunk);
     } catch (err) {
       this.logger.warn('Native decode error, attempting recovery:', err);
-      this.attemptRecovery();
+      this.attemptRecovery(err);
     }
   }
 

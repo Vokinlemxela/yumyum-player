@@ -301,7 +301,7 @@ export class WebGLVideoRenderer {
           stencil: false,
           antialias: false,
           premultipliedAlpha: false,
-          preserveDrawingBuffer: false,
+          preserveDrawingBuffer: true,
           powerPreference: 'high-performance',
         });
       }
