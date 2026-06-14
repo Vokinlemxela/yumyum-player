@@ -17,7 +17,7 @@ afterEach(() => {
 });
 
 const makeController = (audioClock: (() => number | null) | null = null) =>
-  new PlaybackController(audioClock, null, null, null, new Logger('test', 'silent'));
+  new PlaybackController(audioClock, null, null, null, undefined, undefined, undefined, new Logger('test', 'silent'));
 
 describe('PlaybackController playback rate', () => {
   it('defaults to 1x', () => {
@@ -131,5 +131,85 @@ describe('PlaybackController playback rate', () => {
     c.setPlaybackRate(-1);
     c.setPlaybackRate(NaN);
     expect(c.getPlaybackRate()).toBe(1);
+  });
+
+  describe('lowPower and targetFps options', () => {
+    it('applies frame decimation under targetFps', () => {
+      const c = new PlaybackController(null, null, null, null, 10, undefined, undefined, new Logger('test', 'silent'));
+      // targetFps = 10, so interval is 0.1s. Margin is 0.005s, so frames < 0.095s apart in PTS should be dropped.
+      
+      const mockClose1 = vi.fn();
+      const mockClose2 = vi.fn();
+      const mockClose3 = vi.fn();
+
+      c.enqueueFrame({ pts: 0.0, duration: 0.033, data: { close: mockClose1 } as any });
+      // 0.03s is < 0.095s from 0.0 -> should be dropped
+      c.enqueueFrame({ pts: 0.03, duration: 0.033, data: { close: mockClose2 } as any });
+      // 0.11s is >= 0.095s from 0.0 -> should be kept
+      c.enqueueFrame({ pts: 0.11, duration: 0.033, data: { close: mockClose3 } as any });
+
+      expect(mockClose1).not.toHaveBeenCalled();
+      expect(mockClose2).toHaveBeenCalled();
+      expect(mockClose3).not.toHaveBeenCalled();
+      
+      const diag = c.getDiagnostics();
+      expect(diag.decodedFrames).toBe(3);
+      expect(diag.droppedFrames).toBe(1);
+      expect(diag.queueLength).toBe(2);
+    });
+
+    it('optimizes queue limits and sets default FPS when lowPower is true', () => {
+      const c = new PlaybackController(null, null, null, null, undefined, undefined, true, new Logger('test', 'silent'));
+      const diag = c.getDiagnostics();
+      
+      // When lowPower is active, maxQueueSize defaults to 5.
+      // Let's check if backpressure triggers at queue size 5.
+      let backpressureChange = false;
+      const bpController = new PlaybackController(
+        null,
+        null,
+        (pause) => { backpressureChange = pause; },
+        null,
+        undefined,
+        undefined,
+        true,
+        new Logger('test', 'silent')
+      );
+
+      for (let i = 0; i < 5; i++) {
+        bpController.enqueueFrame({ pts: i * 0.2, duration: 0.2, data: { close: vi.fn() } as any });
+      }
+      expect(backpressureChange).toBe(true); // Should pause decoding at queue size 5
+    });
+
+    it('tracks effectiveFps and decodedFrames in diagnostics', () => {
+      const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+      let rendered: any = null;
+      const c = new PlaybackController(
+        null,
+        (frame) => { rendered = frame; },
+        null,
+        null,
+        undefined,
+        undefined,
+        undefined,
+        new Logger('test', 'silent')
+      );
+      c.start();
+
+      const f1 = { pts: 0.0, duration: 0.03, data: { close: vi.fn() } as any };
+      const f2 = { pts: 0.03, duration: 0.03, data: { close: vi.fn() } as any };
+
+      c.enqueueFrame(f1);
+      c.enqueueFrame(f2);
+      
+      // Trigger a tick by manually calling the private tick method (or through mock requestAnimationFrame if ticked)
+      // Since requestAnimationFrame is stubbed, we can trigger the tick method or just simulate it by invoking it directly.
+      (c as any).tick();
+      
+      const diag = c.getDiagnostics();
+      expect(diag.decodedFrames).toBe(2);
+      expect(diag.effectiveFps).toBe(1); // One frame rendered in the last second
+    });
   });
 });

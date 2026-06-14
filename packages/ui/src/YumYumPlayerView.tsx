@@ -39,6 +39,8 @@ export interface PlayerHandle {
     renderedFrames: number;
     activeCodec: string;
     queueLength: number;
+    decodedFrames?: number;
+    effectiveFps?: number;
   };
   on(event: string, callback: (...args: unknown[]) => void): void;
   off(event: string, callback: (...args: unknown[]) => void): void;

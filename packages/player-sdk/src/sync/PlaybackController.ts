@@ -52,20 +52,36 @@ export class PlaybackController {
   // the WebCodecs output pool and actually slows the decoder. A genuine
   // multi-second look-ahead must buffer RAW segments (cheap), not decoded frames
   // — tracked as a separate follow-up.
-  private readonly maxQueueSize = 30;
-  private readonly minQueueSize = 10;
+  private maxQueueSize = 30;
+  private minQueueSize = 10;
   private isBackpressurePaused = false;
 
   private rafId: number | null = null;
   private isDrawingGap = false;
+
+  private lastKeptPts = -1;
+  private decodedFramesCount = 0;
+  private renderedFrameTimes: number[] = [];
 
   constructor(
     private getAudioClock: (() => number | null) | null, // returns audioCtx.currentTime adjusted for latency
     private onRenderFrame: ((frame: DecodedFrame['data']) => void) | null,
     private onBackpressureChange: ((pause: boolean) => void) | null,
     private onEnded: (() => void) | null | undefined,
+    private targetFps: number | undefined,
+    private renderFps: number | undefined,
+    private lowPower: boolean | undefined,
     private logger: Logger
-  ) {}
+  ) {
+    if (this.lowPower) {
+      if (this.targetFps === undefined) this.targetFps = 8;
+      if (this.renderFps === undefined) this.renderFps = this.targetFps;
+      this.maxQueueSize = 5;
+      this.minQueueSize = 2;
+    } else if (this.targetFps !== undefined) {
+      if (this.renderFps === undefined) this.renderFps = this.targetFps;
+    }
+  }
 
   public get hasStarted(): boolean {
     return this.lastRenderedPTS !== -1;
@@ -79,6 +95,22 @@ export class PlaybackController {
 
   public enqueueFrame(frame: DecodedFrame) {
     this.enqueueCount++;
+    this.decodedFramesCount++;
+
+    if (this.targetFps !== undefined) {
+      if (this.lastKeptPts !== -1 && frame.pts >= this.lastKeptPts && frame.pts - this.lastKeptPts < (1 / this.targetFps) - 0.005) {
+        if (frame.data && 'close' in frame.data) {
+          try {
+            frame.data.close();
+          } catch (err) {
+            this.logger.error('Error closing VideoFrame in targetFps decimation:', err);
+          }
+        }
+        this.droppedFramesCount++;
+        return;
+      }
+      this.lastKeptPts = Math.max(this.lastKeptPts, frame.pts);
+    }
     
     // Insert frame in ascending PTS order to support B-frame reordering
     let insertIdx = this.frameQueue.length;
@@ -148,6 +180,7 @@ export class PlaybackController {
     }
     this.frameQueue = [];
     this.lastRenderedPTS = -1;
+    this.lastKeptPts = -1;
     this.audioCtxStartOffset = null;
     this.isBackpressurePaused = false;
     this.isDrawingGap = false;
@@ -159,10 +192,16 @@ export class PlaybackController {
   }
 
   public getDiagnostics() {
+    const now = performance.now();
+    while (this.renderedFrameTimes.length > 0 && this.renderedFrameTimes[0] < now - 1000) {
+      this.renderedFrameTimes.shift();
+    }
     return {
       queueLength: this.frameQueue.length,
       droppedFrames: this.droppedFramesCount,
       renderedFrames: this.renderedFramesCount,
+      decodedFrames: this.decodedFramesCount,
+      effectiveFps: this.renderedFrameTimes.length,
       playbackState: this.state,
       currentPTS: this.getCurrentTime(),
       backpressureActive: this.isBackpressurePaused,
@@ -273,6 +312,9 @@ export class PlaybackController {
     if (typeof document !== 'undefined' && document.hidden) {
       // Background tab: use setTimeout (100ms / 10fps) to keep playback timeline ticking and prevent freezes
       this.rafId = setTimeout(() => this.tick(), 100) as unknown as number;
+    } else if (this.renderFps !== undefined) {
+      const delay = 1000 / this.renderFps;
+      this.rafId = setTimeout(() => this.tick(), delay) as unknown as number;
     } else {
       this.rafId = requestAnimationFrame(() => this.tick());
     }
@@ -419,6 +461,7 @@ export class PlaybackController {
       if (bestFrame.pts > this.lastRenderedPTS) {
         try {
           this.onRenderFrame?.(bestFrame.data);
+          this.renderedFrameTimes.push(performance.now());
         } catch (err) {
           this.logger.error('Error in onRenderFrame:', err);
         }

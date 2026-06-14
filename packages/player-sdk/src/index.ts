@@ -54,6 +54,12 @@ export interface PlayerConfig {
    * and for guaranteeing identical decoding across devices. Default: false.
    */
   forceSoftwareHevc?: boolean;
+  /** Skip decoded frames to target specific frame rate (e.g. 8 fps). */
+  targetFps?: number;
+  /** Restrict rendering loop frequency independently (or uses targetFps). */
+  renderFps?: number;
+  /** Preset to enable economical settings (targetFps=8, renderFps=8, minimal buffer size). */
+  lowPower?: boolean;
 }
 
 export interface PlayerTelemetry {
@@ -76,6 +82,10 @@ export interface PlayerTelemetry {
   playbackRate: number;
   /** Message of the last encountered error, if any. */
   lastError?: string;
+  /** Total number of decoded frames received. */
+  decodedFrames?: number;
+  /** Current effective rendering frames per second. */
+  effectiveFps?: number;
 }
 
 export type PlayerEvent = 'play' | 'pause' | 'error' | 'ended';
@@ -227,6 +237,9 @@ export class YumYumPlayer {
       () => {
         this.emit('ended');
       },
+      config.targetFps,
+      config.renderFps,
+      config.lowPower,
       this.logger.createChild('PlaybackController')
     );
 
@@ -427,6 +440,11 @@ export class YumYumPlayer {
             return;
           }
 
+          if (this.lifecycleState === 'PAUSED') {
+            // Discard frames when paused to stop decoding CPU/GPU load
+            return;
+          }
+
           if (type === 'VIDEO') {
             const decoder = this.decoders.get(codec);
             if (decoder) {
@@ -513,6 +531,7 @@ export class YumYumPlayer {
     if (this.lifecycleState === 'PLAYING') {
       this.lifecycleState = 'PAUSED';
     }
+    this.decoders.flushAll();
     this.emit('pause');
   }
 
