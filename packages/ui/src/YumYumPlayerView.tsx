@@ -71,6 +71,8 @@ export interface YumYumPlayerViewProps {
   overlayTopLeft?: React.ReactNode;
   overlayTopRight?: React.ReactNode;
   badges?: { label: string; variant?: 'rec' | 'primary' | 'warning' | 'neutral' }[];
+  /** Control layout mode: 'full' (default player UI), 'minimal' (volume + fullscreen floating), or 'none' (hidden). */
+  chrome?: 'full' | 'minimal' | 'none';
 }
 
 const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
@@ -133,10 +135,18 @@ const STYLE = `
 @keyframes yyv-rot{to{transform:rotate(360deg)}}
 .yyv-error{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#f87171;font:13px ui-monospace,monospace;z-index:20;pointer-events:none}
 .yyv-novideo{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#000;color:#8b8b93;font:600 13px ui-monospace,monospace;letter-spacing:.1em;text-transform:uppercase;z-index:15;pointer-events:none}
-.yyv-overlay-tl{position:absolute;top:8px;left:8px;z-index:50;display:flex;gap:6px;pointer-events:auto}
-.yyv-overlay-tr{position:absolute;top:8px;right:8px;z-index:50;display:flex;gap:6px;pointer-events:auto}
+.yyv-overlay-tl{position:absolute;top:8px;left:8px;z-index:50;display:flex;gap:6px;pointer-events:none}
+.yyv-overlay-tl > *, .yyv-overlay-tr > *{pointer-events:auto}
+.yyv-overlay-tr{position:absolute;top:8px;right:8px;z-index:50;display:flex;gap:6px;pointer-events:none}
 .yyv-bar{position:absolute;left:0;right:0;bottom:0;z-index:30;padding:36px 12px 10px;background:linear-gradient(to top,rgba(0,0,0,.9),rgba(0,0,0,.45) 55%,transparent);transition:opacity .2s;color:#fff}
 .yyv-bar.yyv-hidden{opacity:0;pointer-events:none}
+.yyv-bar-minimal{background:none !important;padding:0 !important;height:40px;bottom:8px;left:8px;right:8px;display:flex;align-items:center;justify-content:space-between;pointer-events:none;transition:opacity .2s, transform .2s}
+.yyv-bar-minimal.yyv-hidden{opacity:0;pointer-events:none;transform:translateY(4px)}
+.yyv-bar-minimal .yyv-row{width:100%;display:flex;justify-content:space-between;align-items:center}
+.yyv-bar-minimal .yyv-vol, .yyv-bar-minimal .yyv-btn-fullscreen{pointer-events:auto;background:rgba(0,0,0,.6);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.12);border-radius:6px;transition:background .15s, border-color .15s}
+.yyv-bar-minimal .yyv-vol{display:flex;align-items:center;padding:4px 6px;height:30px;box-sizing:border-box}
+.yyv-bar-minimal .yyv-btn-fullscreen{width:30px;height:30px;display:flex;align-items:center;justify-content:center;margin-left:auto}
+.yyv-bar-minimal .yyv-vol:hover, .yyv-bar-minimal .yyv-btn-fullscreen:hover{background:rgba(0,0,0,.8);border-color:rgba(255,255,255,.25)}
 .yyv-row{display:flex;align-items:center;gap:14px}
 .yyv-btn{background:none;border:none;color:#fff;cursor:pointer;padding:0;margin:0;display:flex;align-items:center;justify-content:center;opacity:.92;transition:opacity .15s,transform .15s;line-height:0}
 .yyv-btn:hover{opacity:1}
@@ -268,6 +278,7 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
   overlayTopLeft,
   overlayTopRight,
   badges,
+  chrome = 'full',
 }) => {
   const show = (k: PlayerControlKey) => controls?.[k] !== false;
   const t = STRINGS[lang];
@@ -592,6 +603,10 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
   const displayTime = scrubTime !== null ? scrubTime : currentTime;
   const volPct = muted ? 0 : volume * 100;
   const barHidden = isPlaying && !controlsVisible && !settingsOpen;
+  
+  const barClass = chrome === 'minimal'
+    ? `yyv-bar yyv-bar-minimal${barHidden ? ' yyv-hidden' : ''}`
+    : `yyv-bar${barHidden ? ' yyv-hidden' : ''}`;
 
   return (
     <div
@@ -641,100 +656,102 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
 
       {hasError && <div className="yyv-error">Playback error</div>}
 
-      <div
-        className={`yyv-bar${barHidden ? ' yyv-hidden' : ''}`}
-        onMouseEnter={() => { if (hideTimer.current) clearTimeout(hideTimer.current); }}
-      >
-        {show('timeline') && (
-          <div className="yyv-tlrow">
-            {isLive ? (
-              <div className="yyv-live"><span className="yyv-livedot" />{t.live}</div>
-            ) : (
-              <Timeline
-                currentTime={displayTime}
-                duration={duration}
-                buffered={buffered}
-                accent={accentColor}
-                onScrubStart={() => { scrubbing.current = true; }}
-                onScrubMove={(tt) => setScrubTime(tt)}
-                onScrubEnd={() => { scrubbing.current = false; setScrubTime(null); }}
-                onSeek={(tt) => { playerRef.current?.seek(tt); setCurrentTime(tt); }}
-              />
-            )}
-          </div>
-        )}
-
-        <div className="yyv-row">
-          {show('play') && (
-            <Button variant="ghost" className="yyv-btn" onClick={togglePlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
-              {isPlaying ? <PauseIcon /> : <PlayIcon />}
-            </Button>
-          )}
-
-          {show('volume') && (
-            <div className="yyv-vol">
-              <Button variant="ghost" className="yyv-btn" onClick={toggleMute} aria-label={muted ? 'Unmute' : 'Mute'}>
-                {muted ? <VolumeMuteIcon /> : <VolumeHighIcon />}
-              </Button>
-              <Slider
-                value={volPct}
-                onChange={(val) => applyVolume(val / 100)}
-                className="yyv-volrange"
-              />
-            </div>
-          )}
-
-          {show('time') && (
-            <span className="yyv-time">
-              {isLive ? t.live : `${formatTime(displayTime)} / ${formatTime(duration)}`}
-            </span>
-          )}
-
-          <div className="yyv-spacer" />
-
-          {show('speed') && !show('settings') && (
-            <SpeedQuick rate={rate} accent={accentColor} onPick={applyRate} />
-          )}
-
-          {show('settings') && (
-            <div style={{ position: 'relative' }}>
-              <Button
-                variant="ghost"
-                className="yyv-btn"
-                onClick={() => { setSettingsOpen((s) => !s); revealControls(); }}
-                aria-label={t.settings}
-                style={{ transform: settingsOpen ? 'rotate(45deg)' : undefined }}
-              >
-                <GearIcon />
-              </Button>
-              {settingsOpen && (
-                <SettingsMenu
-                  lang={lang}
+      {chrome !== 'none' && (
+        <div
+          className={barClass}
+          onMouseEnter={() => { if (hideTimer.current) clearTimeout(hideTimer.current); }}
+        >
+          {chrome !== 'minimal' && show('timeline') && (
+            <div className="yyv-tlrow">
+              {isLive ? (
+                <div className="yyv-live"><span className="yyv-livedot" />{t.live}</div>
+              ) : (
+                <Timeline
+                  currentTime={displayTime}
+                  duration={duration}
+                  buffered={buffered}
                   accent={accentColor}
-                  rate={rate}
-                  autoplay={autoplay}
-                  loop={loop}
-                  onRate={applyRate}
-                  onAutoplay={(v) => { setAutoplay(v); writeStore(K('autoplay'), v); }}
-                  onLoop={(v) => { setLoop(v); writeStore(K('loop'), v); }}
+                  onScrubStart={() => { scrubbing.current = true; }}
+                  onScrubMove={(tt) => setScrubTime(tt)}
+                  onScrubEnd={() => { scrubbing.current = false; setScrubTime(null); }}
+                  onSeek={(tt) => { playerRef.current?.seek(tt); setCurrentTime(tt); }}
                 />
               )}
             </div>
           )}
 
-          {show('pip') && pipSupported && (
-            <Button variant="ghost" className="yyv-btn" onClick={togglePip} aria-label="Picture in picture">
-              <PipIcon />
-            </Button>
-          )}
+          <div className="yyv-row">
+            {chrome !== 'minimal' && show('play') && (
+              <Button variant="ghost" className="yyv-btn" onClick={togglePlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
+                {isPlaying ? <PauseIcon /> : <PlayIcon />}
+              </Button>
+            )}
 
-          {show('fullscreen') && (
-            <Button variant="ghost" className="yyv-btn" onClick={toggleFullscreen} aria-label="Fullscreen">
-              {isFullscreen ? <FullscreenExitIcon /> : <FullscreenIcon />}
-            </Button>
-          )}
+            {show('volume') && (
+              <div className="yyv-vol">
+                <Button variant="ghost" className="yyv-btn" onClick={toggleMute} aria-label={muted ? 'Unmute' : 'Mute'}>
+                  {muted ? <VolumeMuteIcon /> : <VolumeHighIcon />}
+                </Button>
+                <Slider
+                  value={volPct}
+                  onChange={(val) => applyVolume(val / 100)}
+                  className="yyv-volrange"
+                />
+              </div>
+            )}
+
+            {chrome !== 'minimal' && show('time') && (
+              <span className="yyv-time">
+                {isLive ? t.live : `${formatTime(displayTime)} / ${formatTime(duration)}`}
+              </span>
+            )}
+
+            {chrome !== 'minimal' && <div className="yyv-spacer" />}
+
+            {chrome !== 'minimal' && show('speed') && !show('settings') && (
+              <SpeedQuick rate={rate} accent={accentColor} onPick={applyRate} />
+            )}
+
+            {chrome !== 'minimal' && show('settings') && (
+              <div style={{ position: 'relative' }}>
+                <Button
+                  variant="ghost"
+                  className="yyv-btn"
+                  onClick={() => { setSettingsOpen((s) => !s); revealControls(); }}
+                  aria-label={t.settings}
+                  style={{ transform: settingsOpen ? 'rotate(45deg)' : undefined }}
+                >
+                  <GearIcon />
+                </Button>
+                {settingsOpen && (
+                  <SettingsMenu
+                    lang={lang}
+                    accent={accentColor}
+                    rate={rate}
+                    autoplay={autoplay}
+                    loop={loop}
+                    onRate={applyRate}
+                    onAutoplay={(v) => { setAutoplay(v); writeStore(K('autoplay'), v); }}
+                    onLoop={(v) => { setLoop(v); writeStore(K('loop'), v); }}
+                  />
+                )}
+              </div>
+            )}
+
+            {chrome !== 'minimal' && show('pip') && pipSupported && (
+              <Button variant="ghost" className="yyv-btn" onClick={togglePip} aria-label="Picture in picture">
+                <PipIcon />
+              </Button>
+            )}
+
+            {show('fullscreen') && (
+              <Button variant="ghost" className="yyv-btn yyv-btn-fullscreen" onClick={toggleFullscreen} aria-label="Fullscreen">
+                {isFullscreen ? <FullscreenExitIcon /> : <FullscreenIcon />}
+              </Button>
+            )}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };

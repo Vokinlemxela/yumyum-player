@@ -184,4 +184,43 @@ describe('YumYumPlayerView scrubber → player.seek()', () => {
       expect(screen.getByText('1:00 / 1:40')).toBeTruthy();
     });
   });
+
+  describe('chrome presets', () => {
+    it('renders full chrome controls by default', async () => {
+      const { player } = makeMockPlayer();
+      const createPlayer = vi.fn().mockResolvedValue({ player, isLive: false });
+      const { container } = render(<YumYumPlayerView createPlayer={createPlayer} />);
+      
+      await waitFor(() => {
+        expect(container.querySelector('.yyv-bar')).toBeTruthy();
+        expect(container.querySelector('.yyv-bar-minimal')).toBeFalsy();
+      });
+    });
+
+    it('renders minimal chrome with only volume and fullscreen buttons', async () => {
+      const { player } = makeMockPlayer();
+      const createPlayer = vi.fn().mockResolvedValue({ player, isLive: false });
+      const { container } = render(<YumYumPlayerView createPlayer={createPlayer} chrome="minimal" />);
+      
+      await waitFor(() => {
+        expect(container.querySelector('.yyv-bar-minimal')).toBeTruthy();
+        expect(container.querySelector('.yyv-tlwrap')).toBeFalsy();
+        expect(container.querySelector('button[aria-label="Play"]')).toBeFalsy();
+        expect(container.querySelector('button[aria-label="Settings"]')).toBeFalsy();
+        expect(container.querySelector('.yyv-vol')).toBeTruthy();
+        expect(container.querySelector('.yyv-btn-fullscreen')).toBeTruthy();
+      });
+    });
+
+    it('renders no chrome when chrome="none"', async () => {
+      const { player } = makeMockPlayer();
+      const createPlayer = vi.fn().mockResolvedValue({ player, isLive: false });
+      const { container } = render(<YumYumPlayerView createPlayer={createPlayer} chrome="none" />);
+      
+      await waitFor(() => {
+        expect(container.querySelector('.yyv-bar')).toBeFalsy();
+        expect(container.querySelector('.yyv-bar-minimal')).toBeFalsy();
+      });
+    });
+  });
 });
