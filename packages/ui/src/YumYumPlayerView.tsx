@@ -73,6 +73,13 @@ export interface YumYumPlayerViewProps {
   badges?: { label: string; variant?: 'rec' | 'primary' | 'warning' | 'neutral' }[];
   /** Control layout mode: 'full' (default player UI), 'minimal' (volume + fullscreen floating), or 'none' (hidden). */
   chrome?: 'full' | 'minimal' | 'none';
+  /**
+   * Called with the live player handle once it is created (and with `null` when
+   * it is torn down / re-created). Lets the host drive playback imperatively
+   * (mute/setVolume/setPlaybackRate/seek/play/pause) — e.g. a VMS that renders
+   * its own control bar with `chrome:'none'`.
+   */
+  onReady?: (player: PlayerHandle | null) => void;
 }
 
 const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
@@ -279,6 +286,7 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
   overlayTopRight,
   badges,
   chrome = 'full',
+  onReady,
 }) => {
   const show = (k: PlayerControlKey) => controls?.[k] !== false;
   const t = STRINGS[lang];
@@ -293,6 +301,10 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
   const loopRef = useRef(false);
   const hoveredRef = useRef(false);
   const pipPreppedRef = useRef(false); // PiP <video> mirror is live and ready
+  // onReady kept in a ref so a changing callback prop doesn't re-run the
+  // player-creation effect (and thus reload the stream).
+  const onReadyRef = useRef(onReady);
+  onReadyRef.current = onReady;
 
   const [volume, setVolume] = useState(() => readStore<number>(`${persistKeyPrefix}:volume`, 0.8));
   const [muted, setMuted] = useState(() => readStore<boolean>(`${persistKeyPrefix}:muted`, true));
@@ -345,6 +357,7 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
         if (!mounted) { player.destroy(); return; }
         created = player;
         playerRef.current = player;
+        onReadyRef.current?.(player);
         setIsLive(live);
 
         player.setVolume(muted ? 0 : volume);
@@ -414,6 +427,7 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
         try { created.destroy(); } catch { /* noop */ }
       }
       playerRef.current = null;
+      onReadyRef.current?.(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [createPlayer]);

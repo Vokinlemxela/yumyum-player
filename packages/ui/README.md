@@ -45,6 +45,26 @@ export function Player() {
 
 Exported types: `YumYumPlayerViewProps`, `PlayerHandle`, `PlayerControlKey`.
 
+### Embedding in a host with its own controls (e.g. a VMS)
+
+Set `chrome="none"` to render **no control buttons** — the view still shows the
+canvas, intrinsic state overlays (loading spinner, error, "no video") and the
+`overlayTopLeft/overlayTopRight/badges` slots. Get the live player via
+`onReady` and drive playback yourself:
+
+```tsx
+<YumYumPlayerView
+  createPlayer={createPlayer}
+  chrome="none"
+  onReady={(player) => { hostRef.current = player; /* player?.mute(true) ... */ }}
+  overlayTopRight={<MyControlBar />}
+/>
+```
+
+`onReady(player)` fires when the player is created and `onReady(null)` when it is
+torn down/recreated. Do fullscreen on your own container element. (`chrome="minimal"`
+exists for generic single-player embeds; hosts with their own UI use `none`.)
+
 ## License
 
 MIT — see the repository [LICENSE](../../LICENSE).

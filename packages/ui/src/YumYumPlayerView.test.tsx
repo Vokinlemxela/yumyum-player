@@ -223,4 +223,26 @@ describe('YumYumPlayerView scrubber → player.seek()', () => {
       });
     });
   });
+
+  describe('onReady handle', () => {
+    it('passes the player handle to onReady so the host can drive playback', async () => {
+      const { player } = makeMockPlayer();
+      const createPlayer = vi.fn().mockResolvedValue({ player, isLive: true });
+      const onReady = vi.fn();
+      const { unmount } = render(
+        <YumYumPlayerView createPlayer={createPlayer} chrome="none" onReady={onReady} />,
+      );
+
+      await waitFor(() => expect(onReady).toHaveBeenCalledWith(player));
+
+      // Host can drive the player imperatively via the handle.
+      const handed = onReady.mock.calls[0][0];
+      handed.mute(true);
+      expect(player.mute).toHaveBeenCalledWith(true);
+
+      // On teardown the handle is revoked (null).
+      unmount();
+      expect(onReady).toHaveBeenLastCalledWith(null);
+    });
+  });
 });
