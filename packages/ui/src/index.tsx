@@ -21,11 +21,11 @@ const STYLE = `
 .yyp-btn-ghost:hover{background:rgba(255,255,255,.05)}
 .yyp-btn:active{transform:scale(.95)}
 
-.yyp-input{background:#000;border:1px solid var(--yyp-border,#1a1a1a);border-radius:4px;padding:8px 10px;color:#fff;font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:10px;outline:none;transition:border-color .15s}
+.yyp-input{background:#000;border:1px solid var(--yyp-border,#1a1a1a);border-radius:4px;padding:8px 10px;color:#fff;font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px;outline:none;transition:border-color .15s}
 .yyp-input:focus{border-color:var(--yyp-accent,#00ff66)}
 .yyp-input::placeholder{color:rgba(160,160,160,.45)}
 
-.yyp-select{background:#000;border:1px solid var(--yyp-border,#1a1a1a);border-radius:4px;padding:6px 8px;color:#fff;font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:10px;outline:none;transition:border-color .15s}
+.yyp-select{background:#000;border:1px solid var(--yyp-border,#1a1a1a);border-radius:4px;padding:6px 8px;color:#fff;font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px;outline:none;transition:border-color .15s}
 .yyp-select:focus{border-color:var(--yyp-accent,#00ff66)}
 
 .yyp-slider{position:relative;height:6px;width:100%;background:rgba(255,255,255,.15);border-radius:999px;cursor:pointer;overflow:hidden;outline:none;user-select:none}
@@ -260,3 +260,20 @@ export const Select: React.FC<SelectProps> = ({ children, className = '', ...pro
     </select>
   );
 };
+
+// ==================== TEXTAREA PRIMITIVE ====================
+export interface TextAreaProps extends React.TextareaHTMLAttributes<HTMLTextAreaElement> {}
+
+export const TextArea: React.FC<TextAreaProps> = ({ className = '', ...props }) => {
+  useEffect(() => {
+    ensureStyles();
+  }, []);
+
+  return (
+    <textarea
+      className={`yyp-input resize-none ${className}`}
+      {...props}
+    />
+  );
+};
+

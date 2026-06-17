@@ -714,6 +714,15 @@ export class StreamLoader implements IStreamLoader {
           }
           readChunk();
         } catch (err) {
+          const isAbort = (err instanceof Error && err.name === 'AbortError') ||
+            (err instanceof Error && err.message.includes('aborted')) ||
+            (this.loopGeneration !== gen) ||
+            (!this.isDownloading);
+          
+          if (isAbort) {
+            this.logger.debug('MP4 chunk read aborted or generation changed.');
+            return;
+          }
           this.logger.error('Error reading MP4 stream chunk:', err);
           this.isDownloading = false;
           if (this.onError) this.onError(err instanceof Error ? err : new Error(String(err)));

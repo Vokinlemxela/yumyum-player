@@ -1,6 +1,6 @@
 {
   "name": "@yumyum-player/core",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Yum-yum Player — Multi-codec browser video player engine. H.264, HEVC/H.265, MJPEG with WebCodecs + WebGL2 rendering.",
   "license": "MIT",
   "author": "Vokinlemxela",
