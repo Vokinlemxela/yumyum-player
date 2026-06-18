@@ -458,6 +458,22 @@ export function parseAudioSpecificConfig(trak: Uint8Array): AudioSpecificConfigI
 }
 
 /**
+ * Rebase a self-contained fMP4 sample PTS onto the continuous media timeline.
+ *
+ * Each archive segment carries its own ftyp+moov+moof, so its tfdt/trun timing
+ * is segment-local. `timelineOffset` (captured from the first sample after each
+ * moov) zeroes the intra-segment time to 0..dur; `segmentTimeBase` (the sum of
+ * preceding segment durations, supplied via SEGMENT_META) then shifts it onto
+ * the gap-collapsed media timeline.
+ *
+ * For live fMP4 (one EXT-X-MAP, moof-only, no SEGMENT_META) `segmentTimeBase`
+ * is 0, so this reduces to the existing `raw − timelineOffset` behaviour.
+ */
+export function rebaseFmp4Pts(rawSeconds: number, timelineOffset: number, segmentTimeBase: number): number {
+  return rawSeconds - timelineOffset + segmentTimeBase;
+}
+
+/**
  * Wrap a raw AAC access unit in a 7-byte ADTS header so it can flow through the
  * ADTS-oriented AAC decoder path. fMP4 carries raw AAC frames (no ADTS), so we
  * synthesize the header from the track's AudioSpecificConfig.

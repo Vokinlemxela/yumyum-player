@@ -16,6 +16,7 @@ import {
   parseTfdtBaseMediaDecodeTime,
   parseAudioSpecificConfig,
   buildAdtsFrame,
+  rebaseFmp4Pts,
   AAC_SAMPLE_RATES,
   ROLLOVER,
 } from './parsers.js';
@@ -302,5 +303,29 @@ describe('buildAdtsFrame', () => {
     expect(header!.frameLength).toBe(payload.length + 7);
     // Payload survives intact after the 7-byte header.
     expect(Array.from(frame.subarray(7))).toEqual(Array.from(payload));
+  });
+});
+
+describe('rebaseFmp4Pts', () => {
+  it('zeroes intra-segment time and shifts onto the media base', () => {
+    // Segment whose moov-local PTS starts at 100s, mediaBase 12s.
+    // First sample: 100 − 100 + 12 = 12; 0.5s later: 100.5 − 100 + 12 = 12.5.
+    expect(rebaseFmp4Pts(100, 100, 12)).toBe(12);
+    expect(rebaseFmp4Pts(100.5, 100, 12)).toBeCloseTo(12.5, 6);
+  });
+
+  it('is a no-op shift for live (segmentTimeBase = 0)', () => {
+    // Matches the legacy `raw − timelineOffset` behaviour exactly.
+    expect(rebaseFmp4Pts(5.25, 5, 0)).toBeCloseTo(0.25, 6);
+    expect(rebaseFmp4Pts(5, 5, 0)).toBe(0);
+  });
+
+  it('stays monotonic and continuous across a gap-collapsed segment boundary', () => {
+    // Segment A: base 0, offset 0, dur 4 → ends at media 4 (raw 4).
+    const endOfA = rebaseFmp4Pts(4, 0, 0);
+    // Segment B (post-gap): its own moov offset 1000, base 4 → starts at media 4.
+    const startOfB = rebaseFmp4Pts(1000, 1000, 4);
+    expect(startOfB).toBe(endOfA); // seamless, no backward jump
+    expect(rebaseFmp4Pts(1002, 1000, 4)).toBe(6); // continues forward
   });
 });

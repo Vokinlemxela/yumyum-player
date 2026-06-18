@@ -10,6 +10,31 @@ import { Logger } from '../utils/Logger.js';
 export type LoaderKind = 'pull' | 'push';
 
 /**
+ * Per-segment timing metadata emitted by archive VOD loaders just BEFORE the
+ * segment bytes are delivered via {@link LoaderDeps.onData}. Lets the demuxer
+ * rebase the self-contained fMP4 segment onto a continuous media timeline.
+ * Only archive playlists (HLS-VOD carrying `#EXT-X-PROGRAM-DATE-TIME`) emit it.
+ */
+export interface SegmentMeta {
+  /** Sum of durations (s) of all preceding segments — the media-time base for this segment. */
+  mediaBase: number;
+  /** Wall-clock start of this segment (ms epoch), from PROGRAM-DATE-TIME. */
+  programDateTime: number;
+  /** True when a recording gap precedes this segment (`#EXT-X-DISCONTINUITY`). */
+  discontinuity: boolean;
+}
+
+/**
+ * Wall-clock coverage of an archive VOD timeline: the absolute time span the
+ * recording covers plus any recording gaps inside it.
+ */
+export interface WallClockRange {
+  startMs: number;
+  endMs: number;
+  gaps: { startMs: number; endMs: number }[];
+}
+
+/**
  * Dependencies handed to every loader factory. A loader uses only what it needs.
  */
 export interface LoaderDeps {
@@ -19,6 +44,12 @@ export interface LoaderDeps {
    * demux (`false`). The buffer is transferred, so callers must not reuse it.
    */
   onData: (buffer: ArrayBuffer, streaming: boolean) => void;
+  /**
+   * Timing metadata for the NEXT segment fed via {@link onData}. Emitted in
+   * order, immediately before that segment's bytes, only for archive VOD
+   * segments. Live / progressive MP4 / mock paths never call it.
+   */
+  onSegmentMeta?: (meta: SegmentMeta) => void;
   /** Locally generated mock elementary packets that bypass the demuxer worker. */
   onMockPacket: ((packet: Uint8Array, type: 'video' | 'audio', pts: number, isKey: boolean) => void) | null;
   onError: ((error: Error) => void) | null;
@@ -48,6 +79,25 @@ export interface IStreamLoader {
    * loaders may omit it.
    */
   getBufferedEnd?(): number;
+  /**
+   * Whether this loader exposes a wall-clock (PROGRAM-DATE-TIME) timeline.
+   * Only archive VOD loaders return `true`; live / progressive / mock omit it.
+   */
+  hasProgramDateTime?(): boolean;
+  /**
+   * Map a continuous media-time position (s) to absolute wall-clock (ms epoch),
+   * using the PROGRAM-DATE-TIME of the segment that contains it. `null` when no
+   * wall-clock timeline is available.
+   */
+  mediaToWall?(mediaSeconds: number): number | null;
+  /**
+   * Map an absolute wall-clock instant (ms epoch) to a media-time position (s).
+   * Instants inside a recording gap snap forward to the next segment. `null`
+   * when no wall-clock timeline is available.
+   */
+  wallToMedia?(wallMs: number): number | null;
+  /** Absolute wall-clock coverage of the archive, or `null` when unavailable. */
+  getWallClockRange?(): WallClockRange | null;
   /** Release all resources. */
   destroy(): void;
 }

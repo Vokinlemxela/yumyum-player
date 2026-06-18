@@ -16,6 +16,7 @@ import {
   parseTfdtBaseMediaDecodeTime,
   parseAudioSpecificConfig,
   buildAdtsFrame,
+  rebaseFmp4Pts,
 } from './parsers.js';
 import type { SampleInfo, AudioSpecificConfigInfo } from './parsers.js';
 
@@ -94,6 +95,17 @@ let currentAVCC: Uint8Array | null = null;
 let currentHVCC: Uint8Array | null = null;
 let currentParsedCodec: string | undefined = undefined;
 let fmp4TimelineOffset: number | null = null;
+/**
+ * Archive VOD only: media-time base (s) of the segment currently being demuxed,
+ * supplied via SEGMENT_META just before the segment's bytes. Each archive
+ * segment is self-contained (its own ftyp+moov+moof), so fmp4TimelineOffset
+ * re-zeros intra-segment time on every moov; adding this base stitches segments
+ * into one continuous, monotonic media timeline. Live (one EXT-X-MAP, moof-only,
+ * no meta) keeps this at 0 and is unaffected.
+ */
+let currentSegmentTimeBase = 0;
+/** True when SEGMENT_META flagged a recording gap before the current segment. */
+let pendingDiscontinuity = false;
 
 interface FragmentTrackSamples {
   trackId: number;
@@ -141,12 +153,24 @@ self.onmessage = (e: MessageEvent) => {
       currentHVCC = null;
       currentParsedCodec = undefined;
       fmp4TimelineOffset = null;
+      currentSegmentTimeBase = 0;
+      pendingDiscontinuity = false;
       trackTypes.clear();
       trackTimescales.clear();
       audioConfig = null;
       currentFragmentSamples = [];
 
       logDebug('Initialized config:', config);
+      break;
+
+    case 'SEGMENT_META':
+      // Archive VOD: timing for the segment whose bytes follow immediately.
+      // Same worker + ordered postMessage guarantees this lands before its
+      // DEMUX. mediaBase stitches the self-contained fMP4 onto the continuous
+      // timeline; discontinuity forces decoder reinit on the next moov.
+      currentSegmentTimeBase = typeof e.data.mediaBase === 'number' ? e.data.mediaBase : 0;
+      pendingDiscontinuity = e.data.discontinuity === true;
+      logDebug(`Segment meta: mediaBase=${currentSegmentTimeBase}s, discontinuity=${pendingDiscontinuity}`);
       break;
 
     case 'DEMUX':
@@ -200,6 +224,11 @@ self.onmessage = (e: MessageEvent) => {
       currentParsedCodec = undefined;
       currentFragmentSamples = [];
       fmp4TimelineOffset = null;
+      // A FLUSH only happens on an explicit seek. Reset the archive media base;
+      // the next SEGMENT_META (post-seek) re-establishes it. Adjacent segments
+      // do NOT flush, so seamless stitching is preserved.
+      currentSegmentTimeBase = 0;
+      pendingDiscontinuity = false;
       logDebug('Flushed timelines and streaming buffers');
       break;
   }
@@ -1059,7 +1088,11 @@ function processFMP4Box(type: string, boxData: Uint8Array) {
             fmp4TimelineOffset = ptsSeconds;
             logWarn(`Established fMP4 timeline offset: ${fmp4TimelineOffset}s`);
           }
-          ptsSeconds -= fmp4TimelineOffset;
+          // Intra-segment time (0..dur), then shift onto the continuous media
+          // timeline. currentSegmentTimeBase is 0 for live (no SEGMENT_META), so
+          // this is a harmless no-op there; for archive VOD it stitches
+          // consecutive self-contained segments without resetting the clock.
+          ptsSeconds = rebaseFmp4Pts(ptsSeconds, fmp4TimelineOffset, currentSegmentTimeBase);
 
           if (trackFrag.type === 'video') {
             const isKey = detectFMP4Keyframe(sampleData);

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { StreamLoader } from './StreamLoader.js';
-import { LoaderDeps } from './IStreamLoader.js';
+import { LoaderDeps, SegmentMeta } from './IStreamLoader.js';
 import { Logger } from '../utils/Logger.js';
 
 // ─── Test helpers ───────────────────────────────────────────────────
@@ -205,6 +205,225 @@ describe('StreamLoader live streams are unaffected by the look-ahead', () => {
     // it never leads the fed media position by the RAW_LOOKAHEAD margin.
     const fedMediaEnd = fed.length * SEG_DURATION + (SEG_COUNT - 2) * SEG_DURATION;
     expect(loader.getBufferedEnd()).toBeLessThanOrEqual(fedMediaEnd);
+
+    loader.destroy();
+  });
+});
+
+// ─── Archive VOD: PROGRAM-DATE-TIME wall-clock timeline ─────────────
+
+const ARCHIVE_SEG_DURATION = 4;
+
+/** A valid fMP4 payload begins (after the 4-byte size) with the 'ftyp' box type. */
+function makeFmp4Segment(): ArrayBuffer {
+  const u8 = new Uint8Array(16);
+  // size (big-endian) then 'ftyp'
+  u8[3] = 16;
+  u8[4] = 0x66; u8[5] = 0x74; u8[6] = 0x79; u8[7] = 0x70; // ftyp
+  return u8.buffer;
+}
+
+interface ArchiveBuilderOpts {
+  /** Wall-clock epoch ms of the first segment's PROGRAM-DATE-TIME. */
+  startMs: number;
+  /** Number of segments before a recording gap (use full count for no gap). */
+  preGapCount: number;
+  totalCount: number;
+  /** Gap length in ms inserted before the post-gap segment (0 = contiguous). */
+  gapMs: number;
+  /** Drop trailing fractional millis from RFC3339 to mimic backend output. */
+  noMillis?: boolean;
+}
+
+/** Build an archive HLS-VOD playlist: VOD + per-segment PDT + one DISCONTINUITY. */
+function makeArchivePlaylist(opts: ArchiveBuilderOpts): string {
+  const lines = ['#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-PLAYLIST-TYPE:VOD', `#EXT-X-TARGETDURATION:${ARCHIVE_SEG_DURATION}`];
+  let wall = opts.startMs;
+  for (let i = 0; i < opts.totalCount; i++) {
+    if (i === opts.preGapCount && opts.gapMs > 0) {
+      wall += opts.gapMs; // recording gap before this segment
+      lines.push('#EXT-X-DISCONTINUITY');
+    }
+    const iso = opts.noMillis
+      ? new Date(wall).toISOString().replace(/\.\d{3}Z$/, 'Z')
+      : new Date(wall).toISOString();
+    lines.push(`#EXT-X-PROGRAM-DATE-TIME:${iso}`);
+    lines.push(`#EXTINF:${ARCHIVE_SEG_DURATION.toFixed(1)},`);
+    lines.push(`export?start=${i}&duration=${ARCHIVE_SEG_DURATION}&format=fmp4`);
+    wall += ARCHIVE_SEG_DURATION * 1000;
+  }
+  lines.push('#EXT-X-ENDLIST');
+  return lines.join('\n');
+}
+
+function installArchiveFetchMock(playlistText: string, fetchedExports: string[]) {
+  const fetchMock = vi.fn(async (url: string) => {
+    if (url.includes('.m3u8')) {
+      return { ok: true, text: async () => playlistText } as unknown as Response;
+    }
+    fetchedExports.push(url);
+    return { ok: true, arrayBuffer: async () => makeFmp4Segment() } as unknown as Response;
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
+
+function makeArchiveLoader(onData: (buf: ArrayBuffer) => void, onMeta: (m: SegmentMeta) => void) {
+  const deps: LoaderDeps = {
+    onData: (buffer) => onData(buffer),
+    onSegmentMeta: onMeta,
+    onMockPacket: null,
+    onError: null,
+    logger: new Logger('test', 'silent'),
+  };
+  return new StreamLoader(deps);
+}
+
+describe('StreamLoader archive VOD (PROGRAM-DATE-TIME)', () => {
+  const T0 = Date.UTC(2026, 5, 18, 12, 0, 0); // 2026-06-18T12:00:00Z
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('parses per-segment PDT and the DISCONTINUITY flag, with continuous media time', async () => {
+    // 5 segments, gap of 60s before segment index 3.
+    const playlist = makeArchivePlaylist({ startMs: T0, preGapCount: 3, totalCount: 5, gapMs: 60_000 });
+    installArchiveFetchMock(playlist, []);
+
+    const loader = makeArchiveLoader(() => {}, () => {});
+    await loader.loadPlaylist('https://example.com/cameras/1/archive.m3u8');
+
+    expect(loader.hasProgramDateTime()).toBe(true);
+    // Media duration collapses the gap: 5 * 4s = 20s of media.
+    expect(loader.getDuration()).toBe(5 * ARCHIVE_SEG_DURATION);
+
+    const range = loader.getWallClockRange()!;
+    expect(range).not.toBeNull();
+    expect(range.startMs).toBe(T0);
+    // Pre-gap: 3 segments * 4s; then +60s gap; then 2 segments * 4s.
+    const expectedEnd = T0 + 3 * ARCHIVE_SEG_DURATION * 1000 + 60_000 + 2 * ARCHIVE_SEG_DURATION * 1000;
+    expect(range.endMs).toBe(expectedEnd);
+    // Exactly one recording gap, positioned at the discontinuity.
+    expect(range.gaps.length).toBe(1);
+    expect(range.gaps[0].startMs).toBe(T0 + 3 * ARCHIVE_SEG_DURATION * 1000);
+    expect(range.gaps[0].endMs).toBe(T0 + 3 * ARCHIVE_SEG_DURATION * 1000 + 60_000);
+
+    loader.destroy();
+  });
+
+  it('tolerates PROGRAM-DATE-TIME without trailing milliseconds', async () => {
+    const playlist = makeArchivePlaylist({ startMs: T0, preGapCount: 4, totalCount: 4, gapMs: 0, noMillis: true });
+    installArchiveFetchMock(playlist, []);
+
+    const loader = makeArchiveLoader(() => {}, () => {});
+    await loader.loadPlaylist('https://example.com/cameras/1/archive.m3u8');
+
+    expect(loader.hasProgramDateTime()).toBe(true);
+    expect(loader.getWallClockRange()!.startMs).toBe(T0);
+    loader.destroy();
+  });
+
+  it('mediaToWall / wallToMedia are mutually inverse on the continuous (no-gap) timeline', async () => {
+    const playlist = makeArchivePlaylist({ startMs: T0, preGapCount: 6, totalCount: 6, gapMs: 0 });
+    installArchiveFetchMock(playlist, []);
+
+    const loader = makeArchiveLoader(() => {}, () => {});
+    await loader.loadPlaylist('https://example.com/cameras/1/archive.m3u8');
+
+    // Monotonic: increasing media time → strictly increasing wall clock.
+    let prevWall = -Infinity;
+    for (let m = 0; m < 6 * ARCHIVE_SEG_DURATION; m += 1.5) {
+      const wall = loader.mediaToWall(m)!;
+      expect(wall).toBeGreaterThan(prevWall);
+      prevWall = wall;
+      // Round-trips back to the same media time within tolerance.
+      const back = loader.wallToMedia(wall)!;
+      expect(Math.abs(back - m)).toBeLessThan(0.001);
+    }
+
+    // Sanity: media 0 maps to the first PDT; media at the 2nd segment to PDT+4s.
+    expect(loader.mediaToWall(0)).toBe(T0);
+    expect(loader.mediaToWall(ARCHIVE_SEG_DURATION)).toBe(T0 + ARCHIVE_SEG_DURATION * 1000);
+
+    loader.destroy();
+  });
+
+  it('snaps a wall-clock instant inside a gap forward to the post-gap segment mediaBase', async () => {
+    // 4 segments, 60s gap before index 2. Pre-gap media: [0,8); post-gap media base: 8.
+    const playlist = makeArchivePlaylist({ startMs: T0, preGapCount: 2, totalCount: 4, gapMs: 60_000 });
+    installArchiveFetchMock(playlist, []);
+
+    const loader = makeArchiveLoader(() => {}, () => {});
+    await loader.loadPlaylist('https://example.com/cameras/1/archive.m3u8');
+
+    const preGapMedia = 2 * ARCHIVE_SEG_DURATION; // 8s — base of the post-gap segment
+    const postGapPDT = T0 + 2 * ARCHIVE_SEG_DURATION * 1000 + 60_000;
+
+    // Instant 30s into the 60s gap → snaps forward to the post-gap mediaBase.
+    const gapInstant = T0 + 2 * ARCHIVE_SEG_DURATION * 1000 + 30_000;
+    expect(loader.wallToMedia(gapInstant)).toBe(preGapMedia);
+
+    // mediaToWall across the boundary returns the post-gap segment's PDT.
+    expect(loader.mediaToWall(preGapMedia)).toBe(postGapPDT);
+
+    // Before the first segment clamps to media 0; after the end clamps to duration.
+    expect(loader.wallToMedia(T0 - 10_000)).toBe(0);
+    expect(loader.wallToMedia(postGapPDT + 999_999)).toBe(4 * ARCHIVE_SEG_DURATION);
+
+    loader.destroy();
+  });
+
+  it('emits segment meta in order, just before each segment buffer, with growing mediaBase', async () => {
+    const playlist = makeArchivePlaylist({ startMs: T0, preGapCount: 2, totalCount: 4, gapMs: 30_000 });
+    const fetchedExports: string[] = [];
+    installArchiveFetchMock(playlist, fetchedExports);
+
+    // Record the interleaving of meta and data events to assert ordering.
+    const events: Array<{ kind: 'meta'; meta: SegmentMeta } | { kind: 'data' }> = [];
+    const loader = makeArchiveLoader(
+      () => events.push({ kind: 'data' }),
+      (meta) => events.push({ kind: 'meta', meta }),
+    );
+    await loader.loadPlaylist('https://example.com/cameras/1/archive.m3u8');
+
+    loader.start(() => false); // no backpressure: drain all 4 segments
+    await waitFor(() => events.filter((e) => e.kind === 'data').length >= 4);
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Pairs: every data event is immediately preceded by a meta event.
+    const metas: SegmentMeta[] = [];
+    for (let i = 0; i < events.length; i++) {
+      if (events[i].kind === 'data') {
+        expect(events[i - 1]?.kind).toBe('meta');
+        metas.push((events[i - 1] as { kind: 'meta'; meta: SegmentMeta }).meta);
+      }
+    }
+    expect(metas.length).toBe(4);
+    // mediaBase grows by the (collapsed) segment duration — monotonic, gap-free.
+    expect(metas.map((m) => m.mediaBase)).toEqual([0, 4, 8, 12]);
+    // Discontinuity flagged only on the post-gap segment (index 2).
+    expect(metas.map((m) => m.discontinuity)).toEqual([false, false, true, false]);
+
+    loader.destroy();
+  });
+
+  it('does NOT emit meta or expose a wall-clock timeline for plain VOD (no PDT)', async () => {
+    installFetchMock({ playlistText: makePlaylist(false), fetched: [] });
+    let metaCount = 0;
+    const loader = makeArchiveLoader(() => {}, () => { metaCount++; });
+    await loader.loadPlaylist('https://example.com/vod/stream.m3u8');
+
+    expect(loader.hasProgramDateTime()).toBe(false);
+    expect(loader.mediaToWall(5)).toBeNull();
+    expect(loader.wallToMedia(Date.now())).toBeNull();
+    expect(loader.getWallClockRange()).toBeNull();
+
+    loader.start(() => false);
+    await waitFor(() => loader.getBufferedEnd() > 0);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(metaCount).toBe(0); // plain VOD never emits segment meta
 
     loader.destroy();
   });

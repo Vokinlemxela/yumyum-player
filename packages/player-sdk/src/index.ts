@@ -21,7 +21,7 @@ import { PCMAudioWorklet } from './render/PCMAudioWorklet.js';
 import { PlaybackController, DecodedFrame } from './sync/PlaybackController.js';
 import { StreamLoader } from './network/StreamLoader.js';
 import { LoaderRegistry } from './network/LoaderRegistry.js';
-import { IStreamLoader, LoaderDeps } from './network/IStreamLoader.js';
+import { IStreamLoader, LoaderDeps, WallClockRange } from './network/IStreamLoader.js';
 import { PlayerPlugin, PluginContext } from './plugin/types.js';
 import {
   DecoderRegistry,
@@ -101,7 +101,7 @@ export type { LogLevel } from './utils/Logger.js';
 export type { Segment } from './network/StreamLoader.js';
 // Extension API for plugins (Pro modules)
 export type { PlayerPlugin, PluginContext, DecoderFactory, DecoderDeps } from './plugin/types.js';
-export type { IStreamLoader, LoaderFactory, LoaderDeps, LoaderKind } from './network/IStreamLoader.js';
+export type { IStreamLoader, LoaderFactory, LoaderDeps, LoaderKind, SegmentMeta, WallClockRange } from './network/IStreamLoader.js';
 
 // ─── Main Player Class ──────────────────────────────────────────────
 
@@ -282,6 +282,18 @@ export class YumYumPlayer {
         // Discrete HLS segments use DEMUX; continuous live chunks use STREAM_DEMUX.
         if (this.worker) {
           this.worker.postMessage({ type: streaming ? 'STREAM_DEMUX' : 'DEMUX', data: buffer }, [buffer]);
+        }
+      },
+      onSegmentMeta: (meta) => {
+        // Archive VOD only: arrives in order, just before the matching segment's
+        // bytes. Lets the worker rebase the self-contained fMP4 onto a continuous
+        // media timeline. Same worker, so postMessage preserves ordering.
+        if (this.worker) {
+          this.worker.postMessage({
+            type: 'SEGMENT_META',
+            mediaBase: meta.mediaBase,
+            discontinuity: meta.discontinuity,
+          });
         }
       },
       onMockPacket: (mockPacket, type, pts, isKey) => {
@@ -657,6 +669,37 @@ export class YumYumPlayer {
    */
   public getBufferedEnd(): number {
     return this.activeLoader?.getBufferedEnd?.() ?? 0;
+  }
+
+  /**
+   * Absolute wall-clock time (ms epoch) of the current playhead, derived from
+   * the archive's PROGRAM-DATE-TIME timeline. Returns `null` for live /
+   * progressive / mock sources, or any loader without a wall-clock timeline.
+   */
+  public getWallClockTime(): number | null {
+    return this.activeLoader?.mediaToWall?.(this.playbackController.getCurrentTime()) ?? null;
+  }
+
+  /**
+   * Seek to an absolute wall-clock instant (ms epoch) on an archive timeline.
+   * Resolves the instant to a continuous media-time position and performs a
+   * normal (cheap) seek. Instants inside a recording gap snap forward to the
+   * next segment. Returns `false` when the active source has no wall-clock
+   * timeline.
+   */
+  public seekToWallClock(wallMs: number): boolean {
+    const mediaTime = this.activeLoader?.wallToMedia?.(wallMs);
+    if (mediaTime == null) return false;
+    this.seek(mediaTime);
+    return true;
+  }
+
+  /**
+   * Absolute wall-clock coverage of the archive: `{ startMs, endMs, gaps }`.
+   * Returns `null` for sources without a PROGRAM-DATE-TIME timeline.
+   */
+  public getCoverage(): WallClockRange | null {
+    return this.activeLoader?.getWallClockRange?.() ?? null;
   }
 
   /** Destroy the player and release all resources */

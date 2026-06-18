@@ -1,11 +1,15 @@
 import { Logger } from '../utils/Logger.js';
 import { MockStreamGenerator } from './MockStreamGenerator.js';
-import { IStreamLoader, LoaderDeps, LoaderKind } from './IStreamLoader.js';
+import { IStreamLoader, LoaderDeps, LoaderKind, SegmentMeta, WallClockRange } from './IStreamLoader.js';
 
 export interface Segment {
   url: string;
   duration: number;
   failed?: boolean; // Track segments that returned 404 (already deleted by FFmpeg)
+  /** Wall-clock start of this segment (ms epoch), from `#EXT-X-PROGRAM-DATE-TIME`. */
+  programDateTime?: number;
+  /** Set when `#EXT-X-DISCONTINUITY` precedes this segment (a recording gap). */
+  discontinuity?: boolean;
 }
 
 export class StreamLoader implements IStreamLoader {
@@ -40,6 +44,12 @@ export class StreamLoader implements IStreamLoader {
   private initSegmentUrl = '';
   private initSegmentBuffer: ArrayBuffer | null = null;
   private needSendInit = false;
+  /**
+   * Archive VOD: a non-live playlist that carries `#EXT-X-PROGRAM-DATE-TIME` on
+   * its segments. Gates the wall-clock timeline and per-segment meta emission;
+   * live / progressive MP4 / mock all keep this `false` and behave as before.
+   */
+  private isArchive = false;
 
   private activeAbortController: AbortController | null = null;
   private loopTimeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -60,15 +70,46 @@ export class StreamLoader implements IStreamLoader {
   }
 
   private onSegmentLoaded: ((segmentData: ArrayBuffer) => void) | null;
+  private onSegmentMeta: ((meta: SegmentMeta) => void) | null;
   private onMockPacket: ((packet: Uint8Array, type: 'video' | 'audio', pts: number, isKey: boolean) => void) | null;
   private onError: ((error: Error) => void) | null;
   private logger: Logger;
 
   constructor(deps: LoaderDeps) {
     this.onSegmentLoaded = (buffer) => deps.onData(buffer, this.isMp4);
+    this.onSegmentMeta = deps.onSegmentMeta ?? null;
     this.onMockPacket = deps.onMockPacket;
     this.onError = deps.onError;
     this.logger = deps.logger;
+  }
+
+  /**
+   * Media-time base (s) of a segment = sum of durations of all preceding
+   * segments. Media time is continuous: recording gaps collapse, and wall-clock
+   * is recovered from each segment's PROGRAM-DATE-TIME.
+   */
+  private mediaBaseOf(index: number): number {
+    let base = 0;
+    for (let i = 0; i < index && i < this.segments.length; i++) {
+      base += this.segments[i].duration;
+    }
+    return base;
+  }
+
+  /**
+   * Emit per-segment timing meta just before its bytes, but only for archive
+   * VOD segments (those carrying a PROGRAM-DATE-TIME). Keeps strict ordering
+   * with onSegmentLoaded so the demuxer rebases the matching bytes.
+   */
+  private emitSegmentMeta(index: number): void {
+    if (!this.isArchive || !this.onSegmentMeta) return;
+    const seg = this.segments[index];
+    if (!seg || seg.programDateTime === undefined) return;
+    this.onSegmentMeta({
+      mediaBase: this.mediaBaseOf(index),
+      programDateTime: seg.programDateTime,
+      discontinuity: seg.discontinuity ?? false,
+    });
   }
 
   // ─── IStreamLoader ──────────────────────────────────────────────────
@@ -93,6 +134,7 @@ export class StreamLoader implements IStreamLoader {
     this.consecutiveFailures = 0;
     this.playlistUrl = url;
     this.isMp4 = false;
+    this.isArchive = false;
     this.initSegmentUrl = '';
     this.initSegmentBuffer = null;
     this.needSendInit = false;
@@ -180,12 +222,28 @@ export class StreamLoader implements IStreamLoader {
     const newSegments: Segment[] = [];
     this.initSegmentUrl = '';
 
+    // PROGRAM-DATE-TIME and DISCONTINUITY apply to the NEXT segment URI line.
+    let pendingPDT: number | undefined;
+    let pendingDiscontinuity = false;
+    let sawPDT = false;
+
     for (let line of lines) {
       line = line.trim();
       if (line.startsWith('#EXT-X-TARGETDURATION:')) {
         this.targetDuration = parseInt(line.split(':')[1], 10);
       } else if (line.startsWith('#EXTINF:')) {
         currentDuration = parseFloat(line.split(':')[1].split(',')[0]);
+      } else if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+        // Value is RFC3339 / RFC3339Nano; Date.parse yields ms epoch and tolerates
+        // missing trailing fractional digits. Skip unparseable values.
+        const raw = line.slice('#EXT-X-PROGRAM-DATE-TIME:'.length).trim();
+        const parsed = Date.parse(raw);
+        if (!Number.isNaN(parsed)) {
+          pendingPDT = parsed;
+          sawPDT = true;
+        }
+      } else if (line === '#EXT-X-DISCONTINUITY') {
+        pendingDiscontinuity = true;
       } else if (line.startsWith('#EXT-X-MAP:')) {
         const match = /URI="([^"]+)"/.exec(line);
         if (match) {
@@ -198,11 +256,18 @@ export class StreamLoader implements IStreamLoader {
         newSegments.push({
           url: segmentUrl,
           duration: currentDuration,
+          programDateTime: pendingPDT,
+          discontinuity: pendingDiscontinuity,
         });
+        pendingPDT = undefined;
+        pendingDiscontinuity = false;
       }
     }
 
     this.isLive = !text.includes('#EXT-X-ENDLIST');
+    // Archive VOD = non-live playlist whose segments carry PROGRAM-DATE-TIME.
+    // This gates the wall-clock timeline and per-segment meta emission.
+    this.isArchive = !this.isLive && sawPDT;
 
     if (this.segments.length === 0) {
       this.segments = newSegments;
@@ -369,6 +434,10 @@ export class StreamLoader implements IStreamLoader {
 
       const raw = this.pendingRaw.shift()!;
       this.currentSegmentIndex = raw.index + 1;
+      // Archive VOD: hand the demuxer this segment's timing meta in order, right
+      // before its bytes, so it can rebase the self-contained fMP4 onto a
+      // continuous media timeline. No-op for live / progressive / mock.
+      this.emitSegmentMeta(raw.index);
       this.onSegmentLoaded?.(raw.buffer);
       didFeed = true;
     }
@@ -626,6 +695,109 @@ export class StreamLoader implements IStreamLoader {
   public getDuration(): number {
     if (this.isLive) return Infinity;
     return this.segments.reduce((sum, seg) => sum + seg.duration, 0);
+  }
+
+  // ─── Wall-clock (PROGRAM-DATE-TIME) timeline ────────────────────────
+  // Available only for archive VOD. PROGRAM-DATE-TIME is the single source of
+  // truth for absolute time; synthetic media time is continuous (gaps collapse)
+  // and wall = PDT(segment) + (mediaTime − mediaBase(segment))·1000.
+
+  /** True when this loader exposes a PROGRAM-DATE-TIME wall-clock timeline. */
+  public hasProgramDateTime(): boolean {
+    return this.isArchive && this.segments.some((s) => s.programDateTime !== undefined);
+  }
+
+  /** Index of the segment whose media-time span [base, base+dur) contains `mediaSeconds`. */
+  private segmentIndexForMedia(mediaSeconds: number): number | null {
+    if (this.segments.length === 0) return null;
+    let base = 0;
+    for (let i = 0; i < this.segments.length; i++) {
+      const dur = this.segments[i].duration;
+      if (mediaSeconds < base + dur) return i;
+      base += dur;
+    }
+    // At or beyond the end — clamp to the last segment.
+    return this.segments.length - 1;
+  }
+
+  /**
+   * Continuous media-time (s) → absolute wall-clock (ms epoch). Uses the
+   * PROGRAM-DATE-TIME of the containing segment so it correctly jumps across
+   * recording gaps. Returns `null` without a wall-clock timeline.
+   */
+  public mediaToWall(mediaSeconds: number): number | null {
+    if (!this.hasProgramDateTime()) return null;
+    const clamped = Math.max(0, mediaSeconds);
+    const idx = this.segmentIndexForMedia(clamped);
+    if (idx === null) return null;
+    const seg = this.segments[idx];
+    if (seg.programDateTime === undefined) return null;
+    const base = this.mediaBaseOf(idx);
+    return seg.programDateTime + (clamped - base) * 1000;
+  }
+
+  /**
+   * Absolute wall-clock (ms epoch) → continuous media-time (s). When `wallMs`
+   * falls inside a recording gap it snaps forward to the next segment's
+   * mediaBase. Before the first / after the last segment it clamps to the
+   * timeline bounds. Returns `null` without a wall-clock timeline.
+   */
+  public wallToMedia(wallMs: number): number | null {
+    if (!this.hasProgramDateTime()) return null;
+
+    let base = 0;
+    let firstBase: number | null = null;
+    let lastEnd = 0;
+
+    for (let i = 0; i < this.segments.length; i++) {
+      const seg = this.segments[i];
+      const dur = seg.duration;
+      if (seg.programDateTime !== undefined) {
+        if (firstBase === null) firstBase = base;
+        if (wallMs < seg.programDateTime) {
+          // Before this segment's PDT: either before the whole timeline or inside
+          // a recording gap. Both snap forward to this segment's mediaBase.
+          return base;
+        }
+        if (wallMs < seg.programDateTime + dur * 1000) {
+          // Inside this segment's wall-clock span.
+          return base + (wallMs - seg.programDateTime) / 1000;
+        }
+        lastEnd = base + dur;
+      }
+      base += dur;
+    }
+
+    // After the last segment with a PDT — clamp to the end of the timeline.
+    if (firstBase !== null) return lastEnd;
+    return null;
+  }
+
+  /** Absolute wall-clock coverage of the archive (start, end, recording gaps). */
+  public getWallClockRange(): WallClockRange | null {
+    if (!this.hasProgramDateTime()) return null;
+
+    let startMs: number | null = null;
+    let endMs: number | null = null;
+    const gaps: { startMs: number; endMs: number }[] = [];
+    let prevEnd: number | null = null;
+
+    for (const seg of this.segments) {
+      if (seg.programDateTime === undefined) continue;
+      const segStart = seg.programDateTime;
+      const segEnd = segStart + seg.duration * 1000;
+      if (startMs === null) startMs = segStart;
+      // A discontinuity flag or a wall-clock jump between consecutive PDTs marks
+      // a recording gap. Use the previous segment's wall-end as the gap start.
+      if (prevEnd !== null && (seg.discontinuity || segStart > prevEnd + 1)) {
+        gaps.push({ startMs: prevEnd, endMs: segStart });
+      }
+      endMs = segEnd;
+      prevEnd = segEnd;
+    }
+
+    if (startMs === null || endMs === null) return null;
+    return { startMs, endMs, gaps };
   }
 
   /**
