@@ -18,6 +18,16 @@ export class StreamLoader implements IStreamLoader {
 
   private segments: Segment[] = [];
   private segmentUrls: Set<string> = new Set();
+  /**
+   * Lazy prefix-sum of segment durations: `segmentStarts[i]` = mediaBase of
+   * segment i (sum of durations [0..i)); the final entry is the total media
+   * duration. Built on first wall-clock query and invalidated on ANY change to
+   * the segments array (see `markSegmentsDirty`). Keeps the wall-clock hot-path
+   * O(1)/O(log n) instead of O(n) per frame on day-long archives.
+   */
+  private segmentStarts: number[] | null = null;
+  /** Cached `hasProgramDateTime` flag, recomputed during parse, never per-call. */
+  private hasPDT = false;
   /** Next segment the worker will be fed (the decode/playback front). */
   private currentSegmentIndex = 0;
   /** Next segment to download into the raw look-ahead buffer (the network front). */
@@ -84,16 +94,42 @@ export class StreamLoader implements IStreamLoader {
   }
 
   /**
+   * Mark the prefix-sum cache stale. Called on every segments-array mutation
+   * (loadPlaylist reset, parseM3U8 append). Rebuilt lazily on the next query so
+   * a burst of appends costs a single rebuild, not one per append.
+   */
+  private markSegmentsDirty(): void {
+    this.segmentStarts = null;
+  }
+
+  /**
+   * Lazily (re)build the prefix-sum of segment durations. `segmentStarts[i]` is
+   * the mediaBase of segment i; `segmentStarts[length]` is the total duration.
+   */
+  private ensureSegmentStarts(): number[] {
+    if (this.segmentStarts !== null) return this.segmentStarts;
+    const starts = new Array<number>(this.segments.length + 1);
+    let acc = 0;
+    for (let i = 0; i < this.segments.length; i++) {
+      starts[i] = acc;
+      acc += this.segments[i].duration;
+    }
+    starts[this.segments.length] = acc;
+    this.segmentStarts = starts;
+    return starts;
+  }
+
+  /**
    * Media-time base (s) of a segment = sum of durations of all preceding
    * segments. Media time is continuous: recording gaps collapse, and wall-clock
-   * is recovered from each segment's PROGRAM-DATE-TIME.
+   * is recovered from each segment's PROGRAM-DATE-TIME. O(1) via the prefix-sum
+   * cache.
    */
   private mediaBaseOf(index: number): number {
-    let base = 0;
-    for (let i = 0; i < index && i < this.segments.length; i++) {
-      base += this.segments[i].duration;
-    }
-    return base;
+    const starts = this.ensureSegmentStarts();
+    if (index <= 0) return 0;
+    if (index >= this.segments.length) return starts[this.segments.length];
+    return starts[index];
   }
 
   /**
@@ -128,6 +164,8 @@ export class StreamLoader implements IStreamLoader {
   public async loadPlaylist(url: string): Promise<void> {
     this.segments = [];
     this.segmentUrls.clear();
+    this.markSegmentsDirty();
+    this.hasPDT = false;
     this.currentSegmentIndex = 0;
     this.fetchIndex = 0;
     this.pendingRaw = [];
@@ -272,7 +310,12 @@ export class StreamLoader implements IStreamLoader {
     if (this.segments.length === 0) {
       this.segments = newSegments;
       this.segmentUrls = new Set(newSegments.map(s => s.url));
-      
+      // Cache the wall-clock flag at parse time so hasProgramDateTime() never
+      // scans the (possibly day-long) segments array per call.
+      this.hasPDT = this.isArchive && newSegments.some((s) => s.programDateTime !== undefined);
+      // Fresh segments array — invalidate the prefix-sum cache.
+      this.markSegmentsDirty();
+
       // If it is a live stream, seek to the active edge (second to last segment) on first load
       if (this.isLive && this.segments.length > 0) {
         this.currentSegmentIndex = Math.max(0, this.segments.length - 2);
@@ -282,12 +325,17 @@ export class StreamLoader implements IStreamLoader {
       const newManifestUrls = new Set(newSegments.map(s => s.url));
 
       // For live stream: only append new segments that aren't already in the queue (O(1) Set lookup)
+      let appended = false;
       for (const newSeg of newSegments) {
         if (!this.segmentUrls.has(newSeg.url)) {
           this.segments.push(newSeg);
           this.segmentUrls.add(newSeg.url);
+          appended = true;
+          if (this.isArchive && newSeg.programDateTime !== undefined) this.hasPDT = true;
         }
       }
+      // Any append changes the prefix-sum; invalidate so the next query rebuilds.
+      if (appended) this.markSegmentsDirty();
 
       // Cleanup: remove old, already played segments to prevent memory leaks in live mode
       if (this.isLive && this.segments.length > 50) {
@@ -307,6 +355,8 @@ export class StreamLoader implements IStreamLoader {
           this.segments = filteredSegments;
           this.segmentUrls = new Set(filteredSegments.map(s => s.url));
           this.currentSegmentIndex = Math.max(0, this.currentSegmentIndex - shift);
+          // Segments array rebuilt — invalidate the prefix-sum cache.
+          this.markSegmentsDirty();
           this.logger.debug(`Cleaned up ${shift} played segments from queue. Active index shifted to: ${this.currentSegmentIndex}`);
         }
       }
@@ -704,20 +754,37 @@ export class StreamLoader implements IStreamLoader {
 
   /** True when this loader exposes a PROGRAM-DATE-TIME wall-clock timeline. */
   public hasProgramDateTime(): boolean {
-    return this.isArchive && this.segments.some((s) => s.programDateTime !== undefined);
+    // Flag is computed during parse (and on live append); O(1) per call.
+    return this.hasPDT;
   }
 
-  /** Index of the segment whose media-time span [base, base+dur) contains `mediaSeconds`. */
+  /**
+   * Index of the segment whose media-time span [base, base+dur) contains
+   * `mediaSeconds`. Binary search over the prefix-sum cache, O(log n). Values
+   * at or beyond the end clamp to the last segment (matching the prior linear
+   * implementation).
+   */
   private segmentIndexForMedia(mediaSeconds: number): number | null {
-    if (this.segments.length === 0) return null;
-    let base = 0;
-    for (let i = 0; i < this.segments.length; i++) {
-      const dur = this.segments[i].duration;
-      if (mediaSeconds < base + dur) return i;
-      base += dur;
+    const n = this.segments.length;
+    if (n === 0) return null;
+    const starts = this.ensureSegmentStarts();
+    // Find the largest i with starts[i] <= mediaSeconds. starts is strictly
+    // non-decreasing; the segment span is [starts[i], starts[i+1]).
+    let lo = 0;
+    let hi = n - 1;
+    let found = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (starts[mid] <= mediaSeconds) {
+        found = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
     }
-    // At or beyond the end — clamp to the last segment.
-    return this.segments.length - 1;
+    // `found` is the segment whose base is <= mediaSeconds; since the last
+    // segment's span is open-ended here, anything at/past the end clamps to it.
+    return found;
   }
 
   /**
@@ -745,32 +812,50 @@ export class StreamLoader implements IStreamLoader {
   public wallToMedia(wallMs: number): number | null {
     if (!this.hasProgramDateTime()) return null;
 
-    let base = 0;
-    let firstBase: number | null = null;
-    let lastEnd = 0;
+    const n = this.segments.length;
+    if (n === 0) return null;
+    const starts = this.ensureSegmentStarts();
 
-    for (let i = 0; i < this.segments.length; i++) {
-      const seg = this.segments[i];
-      const dur = seg.duration;
-      if (seg.programDateTime !== undefined) {
-        if (firstBase === null) firstBase = base;
-        if (wallMs < seg.programDateTime) {
-          // Before this segment's PDT: either before the whole timeline or inside
-          // a recording gap. Both snap forward to this segment's mediaBase.
-          return base;
-        }
-        if (wallMs < seg.programDateTime + dur * 1000) {
-          // Inside this segment's wall-clock span.
-          return base + (wallMs - seg.programDateTime) / 1000;
-        }
-        lastEnd = base + dur;
+    // Archive segments carry monotonically increasing PROGRAM-DATE-TIMEs, so we
+    // can binary-search them. (gates above guarantee at least one PDT segment;
+    // for archive playlists every segment has one.) Find the first segment whose
+    // PDT is strictly greater than wallMs — the "snap forward" boundary.
+    let lo = 0;
+    let hi = n - 1;
+    let firstGreater = n; // index of first segment with PDT > wallMs (n = none)
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const pdt = this.segments[mid].programDateTime;
+      if (pdt !== undefined && pdt > wallMs) {
+        firstGreater = mid;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
       }
-      base += dur;
     }
 
-    // After the last segment with a PDT — clamp to the end of the timeline.
-    if (firstBase !== null) return lastEnd;
-    return null;
+    if (firstGreater === 0) {
+      // Before the first segment's PDT — clamp to the start of the timeline.
+      return starts[0];
+    }
+
+    // Candidate containing segment is the one just before the snap boundary.
+    const idx = firstGreater - 1;
+    const seg = this.segments[idx];
+    const pdt = seg.programDateTime;
+    if (pdt === undefined) return starts[n]; // defensive: no PDT (archive: never)
+
+    if (wallMs < pdt + seg.duration * 1000) {
+      // Inside this segment's wall-clock span.
+      return starts[idx] + (wallMs - pdt) / 1000;
+    }
+    if (firstGreater < n) {
+      // In the recording gap between this segment's end and the next PDT —
+      // snap forward to the next segment's mediaBase.
+      return starts[firstGreater];
+    }
+    // Past the last segment — clamp to the end of the timeline.
+    return starts[n];
   }
 
   /** Absolute wall-clock coverage of the archive (start, end, recording gaps). */

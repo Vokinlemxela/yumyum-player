@@ -17,7 +17,7 @@ afterEach(() => {
 });
 
 const makeController = (audioClock: (() => number | null) | null = null) =>
-  new PlaybackController(audioClock, null, null, null, undefined, undefined, undefined, new Logger('test', 'silent'));
+  new PlaybackController(audioClock, null, null, null, null, undefined, undefined, undefined, new Logger('test', 'silent'));
 
 describe('PlaybackController playback rate', () => {
   it('defaults to 1x', () => {
@@ -135,7 +135,7 @@ describe('PlaybackController playback rate', () => {
 
   describe('lowPower and targetFps options', () => {
     it('applies frame decimation under targetFps', () => {
-      const c = new PlaybackController(null, null, null, null, 10, undefined, undefined, new Logger('test', 'silent'));
+      const c = new PlaybackController(null, null, null, null, null, 10, undefined, undefined, new Logger('test', 'silent'));
       // targetFps = 10, so interval is 0.1s. Margin is 0.005s, so frames < 0.095s apart in PTS should be dropped.
       
       const mockClose1 = vi.fn();
@@ -159,7 +159,7 @@ describe('PlaybackController playback rate', () => {
     });
 
     it('optimizes queue limits and sets default FPS when lowPower is true', () => {
-      const c = new PlaybackController(null, null, null, null, undefined, undefined, true, new Logger('test', 'silent'));
+      const c = new PlaybackController(null, null, null, null, null, undefined, undefined, true, new Logger('test', 'silent'));
       const diag = c.getDiagnostics();
       
       // When lowPower is active, maxQueueSize defaults to 5.
@@ -169,6 +169,7 @@ describe('PlaybackController playback rate', () => {
         null,
         null,
         (pause) => { backpressureChange = pause; },
+        null,
         null,
         undefined,
         undefined,
@@ -182,12 +183,127 @@ describe('PlaybackController playback rate', () => {
       expect(backpressureChange).toBe(true); // Should pause decoding at queue size 5
     });
 
+  });
+
+  describe('buffering signal', () => {
+    // Build a controller wired with a render sink and a buffering listener.
+    const makeBufferingController = (events: boolean[]) => {
+      const c = new PlaybackController(
+        null,
+        () => {},          // onRenderFrame (no-op sink)
+        null,
+        null,
+        (b) => events.push(b),
+        undefined,
+        undefined,
+        undefined,
+        new Logger('test', 'silent'),
+      );
+      return c;
+    };
+
+    it('emits waiting=true once on a gap-stall during PLAYING, not every frame', () => {
+      const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+      const events: boolean[] = [];
+      const c = makeBufferingController(events);
+      c.start();
+
+      // Render one frame so lastRenderedPTS is set and gap detection can engage.
+      c.enqueueFrame({ pts: 0, duration: 0.04, data: { close: vi.fn() } as any });
+      (c as any).tick();
+      expect(c.isBuffering).toBe(false);
+
+      // Advance the clock well past GAP_THRESHOLD with an empty queue → stall.
+      now.mockReturnValue(2000); // +1s, no new frames
+      (c as any).tick();
+      (c as any).tick(); // a second stalled tick must NOT re-emit
+      now.mockReturnValue(2500);
+      (c as any).tick();
+
+      expect(c.isBuffering).toBe(true);
+      // Exactly one true transition despite multiple stalled ticks.
+      expect(events).toEqual([true]);
+
+      c.destroy();
+    });
+
+    it('emits playing=false when a fresh frame ends the stall', () => {
+      const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+      const events: boolean[] = [];
+      const c = makeBufferingController(events);
+      c.start();
+
+      c.enqueueFrame({ pts: 0, duration: 0.04, data: { close: vi.fn() } as any });
+      (c as any).tick();
+
+      now.mockReturnValue(2000); // stall
+      (c as any).tick();
+      expect(c.isBuffering).toBe(true);
+
+      // A frame at the current clock arrives and renders → buffering clears.
+      c.enqueueFrame({ pts: 1.0, duration: 0.04, data: { close: vi.fn() } as any });
+      (c as any).tick();
+      expect(c.isBuffering).toBe(false);
+      expect(events).toEqual([true, false]);
+
+      c.destroy();
+    });
+
+    it('clears buffering on pause (no sticky spinner)', () => {
+      const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+      const events: boolean[] = [];
+      const c = makeBufferingController(events);
+      c.start();
+      c.enqueueFrame({ pts: 0, duration: 0.04, data: { close: vi.fn() } as any });
+      (c as any).tick();
+      now.mockReturnValue(2000);
+      (c as any).tick();
+      expect(c.isBuffering).toBe(true);
+
+      c.pause();
+      expect(c.isBuffering).toBe(false);
+      expect(events).toEqual([true, false]);
+
+      c.destroy();
+    });
+
+    it('clears buffering on seek/flush', () => {
+      const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+      const events: boolean[] = [];
+      const c = makeBufferingController(events);
+      c.start();
+      c.enqueueFrame({ pts: 0, duration: 0.04, data: { close: vi.fn() } as any });
+      (c as any).tick();
+      now.mockReturnValue(2000);
+      (c as any).tick();
+      expect(c.isBuffering).toBe(true);
+
+      c.seek(10); // flush() resets the stall
+      expect(c.isBuffering).toBe(false);
+      expect(events).toEqual([true, false]);
+
+      c.destroy();
+    });
+
+    it('does not flag buffering while paused/idle', () => {
+      const events: boolean[] = [];
+      const c = makeBufferingController(events);
+      // Never started: tick is a no-op, no buffering ever emitted.
+      (c as any).tick();
+      expect(c.isBuffering).toBe(false);
+      expect(events).toEqual([]);
+      c.destroy();
+    });
+  });
+
+  describe('extra diagnostics', () => {
     it('tracks effectiveFps and decodedFrames in diagnostics', () => {
       const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
       let rendered: any = null;
       const c = new PlaybackController(
         null,
         (frame) => { rendered = frame; },
+        null,
         null,
         null,
         undefined,

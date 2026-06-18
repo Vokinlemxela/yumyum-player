@@ -208,6 +208,40 @@ describe('StreamLoader live streams are unaffected by the look-ahead', () => {
 
     loader.destroy();
   });
+
+  it('keeps the prefix-sum cache consistent as live segments are appended', async () => {
+    // Build a live playlist (no ENDLIST) and grow it via a re-parse to drive the
+    // parseM3U8 append branch — the path that must invalidate the cache.
+    const buildLive = (count: number): string => {
+      const lines = ['#EXTM3U', '#EXT-X-VERSION:3', `#EXT-X-TARGETDURATION:${SEG_DURATION}`];
+      for (let i = 0; i < count; i++) {
+        lines.push(`#EXTINF:${SEG_DURATION.toFixed(1)},`);
+        lines.push(`segment_${i}.ts`);
+      }
+      return lines.join('\n'); // no ENDLIST → live
+    };
+
+    const loader = makeLoader(() => {});
+    await loader.loadPlaylist('https://example.com/live/stream.m3u8'); // tracker is VOD; ignore
+    // Seed the segment list directly via the parser (initial live manifest).
+    (loader as any).segments = [];
+    (loader as any).segmentUrls = new Set();
+    (loader as any).parseM3U8(buildLive(SEG_COUNT), 'https://example.com/live/stream.m3u8');
+    expect(loader.getDuration()).toBe(Infinity); // live
+    // mediaBaseOf warms the prefix-sum cache.
+    expect((loader as any).mediaBaseOf(SEG_COUNT)).toBe(SEG_COUNT * SEG_DURATION);
+
+    // Append: re-parse a grown manifest. The cache must invalidate and rebuild.
+    (loader as any).parseM3U8(buildLive(SEG_COUNT + 10), 'https://example.com/live/stream.m3u8');
+
+    expect(loader.hasProgramDateTime()).toBe(false); // live never gains a timeline
+    expect((loader as any).segments.length).toBe(SEG_COUNT + 10);
+    // mediaBase reflects the appended segments (cache rebuilt cleanly, not stale).
+    expect((loader as any).mediaBaseOf(SEG_COUNT + 10)).toBe((SEG_COUNT + 10) * SEG_DURATION);
+    expect((loader as any).mediaBaseOf(SEG_COUNT)).toBe(SEG_COUNT * SEG_DURATION);
+
+    loader.destroy();
+  });
 });
 
 // ─── Archive VOD: PROGRAM-DATE-TIME wall-clock timeline ─────────────
@@ -405,6 +439,82 @@ describe('StreamLoader archive VOD (PROGRAM-DATE-TIME)', () => {
     expect(metas.map((m) => m.mediaBase)).toEqual([0, 4, 8, 12]);
     // Discontinuity flagged only on the post-gap segment (index 2).
     expect(metas.map((m) => m.discontinuity)).toEqual([false, false, true, false]);
+
+    loader.destroy();
+  });
+
+  it('binary-searched wall-clock maps match a brute-force linear reference', async () => {
+    // Irregular segment durations exercise the prefix-sum boundaries (a uniform
+    // duration would hide off-by-one bugs in the binary search).
+    const durations = [4, 4, 2.5, 6, 4, 3.25, 4, 4];
+    const lines = ['#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-PLAYLIST-TYPE:VOD', '#EXT-X-TARGETDURATION:6'];
+    let wall = T0;
+    for (let i = 0; i < durations.length; i++) {
+      lines.push(`#EXT-X-PROGRAM-DATE-TIME:${new Date(wall).toISOString()}`);
+      lines.push(`#EXTINF:${durations[i].toFixed(2)},`);
+      lines.push(`export?start=${i}&format=fmp4`);
+      wall += durations[i] * 1000;
+    }
+    lines.push('#EXT-X-ENDLIST');
+    installArchiveFetchMock(lines.join('\n'), []);
+
+    const loader = makeArchiveLoader(() => {}, () => {});
+    await loader.loadPlaylist('https://example.com/cameras/1/archive.m3u8');
+
+    // Linear reference for mediaToWall: identical to the pre-optimization code.
+    const starts: number[] = [];
+    let acc = 0;
+    for (let i = 0; i < durations.length; i++) { starts.push(acc); acc += durations[i]; }
+    const totalMedia = acc;
+    const refWall = (media: number): number => {
+      const clamped = Math.max(0, media);
+      let idx = durations.length - 1;
+      for (let i = 0; i < durations.length; i++) {
+        if (clamped < starts[i] + durations[i]) { idx = i; break; }
+      }
+      const pdt = T0 + starts[idx] * 1000; // contiguous → PDT == base offset
+      return pdt + (clamped - starts[idx]) * 1000;
+    };
+
+    // Sample densely, including exact segment boundaries and beyond-the-end.
+    const samples: number[] = [];
+    for (let m = -1; m <= totalMedia + 2; m += 0.5) samples.push(m);
+    for (const s of starts) { samples.push(s); samples.push(s - 1e-9); samples.push(s + 1e-9); }
+
+    for (const m of samples) {
+      const got = loader.mediaToWall(m)!;
+      expect(got).toBeCloseTo(refWall(m), 6);
+    }
+
+    loader.destroy();
+  });
+
+  it('rebuilds the prefix-sum cache on a repeated loadPlaylist (no stale state)', async () => {
+    // First archive: 4 segments @ 4s starting at T0.
+    installArchiveFetchMock(
+      makeArchivePlaylist({ startMs: T0, preGapCount: 4, totalCount: 4, gapMs: 0 }),
+      [],
+    );
+    const loader = makeArchiveLoader(() => {}, () => {});
+    await loader.loadPlaylist('https://example.com/cameras/1/archive.m3u8');
+    // Warm the cache.
+    expect(loader.getDuration()).toBe(4 * ARCHIVE_SEG_DURATION);
+    expect(loader.mediaToWall(0)).toBe(T0);
+
+    // Second archive: different start (T0 + 1h) and more segments. A stale cache
+    // would carry over the first playlist's prefix-sum / PDT base.
+    const T1 = T0 + 3_600_000;
+    installArchiveFetchMock(
+      makeArchivePlaylist({ startMs: T1, preGapCount: 7, totalCount: 7, gapMs: 0 }),
+      [],
+    );
+    await loader.loadPlaylist('https://example.com/cameras/2/archive.m3u8');
+
+    expect(loader.getDuration()).toBe(7 * ARCHIVE_SEG_DURATION);
+    expect(loader.mediaToWall(0)).toBe(T1);
+    // mediaBase of the last segment must reflect the NEW playlist.
+    expect(loader.mediaToWall(6 * ARCHIVE_SEG_DURATION)).toBe(T1 + 6 * ARCHIVE_SEG_DURATION * 1000);
+    expect(loader.wallToMedia(T1 + 6 * ARCHIVE_SEG_DURATION * 1000)).toBeCloseTo(6 * ARCHIVE_SEG_DURATION, 6);
 
     loader.destroy();
   });

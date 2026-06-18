@@ -88,7 +88,7 @@ export interface PlayerTelemetry {
   effectiveFps?: number;
 }
 
-export type PlayerEvent = 'play' | 'pause' | 'error' | 'ended';
+export type PlayerEvent = 'play' | 'pause' | 'error' | 'ended' | 'waiting' | 'playing';
 export type PlayerLifecycleState = 'IDLE' | 'LOADING' | 'LOADED' | 'PLAYING' | 'PAUSED' | 'DESTROYED';
 
 // Re-export useful types for advanced consumers
@@ -133,10 +133,15 @@ export class YumYumPlayer {
 
   private listeners: Map<PlayerEvent, Array<(...args: unknown[]) => void>> = new Map();
 
+  /** Tracks whether playback is currently stalled (buffering) during PLAYING. */
+  private buffering = false;
+
   /**
    * Subscribe to player events.
    *
-   * @param event - Event name: 'play', 'pause', 'error', 'ended'
+   * @param event - Event name: 'play', 'pause', 'error', 'ended', 'waiting'
+   *   (buffering started), 'playing' (resumed after buffering). 'waiting' /
+   *   'playing' follow the HTMLMediaElement convention.
    * @param callback - Event handler
    */
   public on(event: PlayerEvent, callback: (...args: unknown[]) => void): void {
@@ -149,7 +154,8 @@ export class YumYumPlayer {
   /**
    * Unsubscribe from player events.
    *
-   * @param event - Event name to unsubscribe from
+   * @param event - Event name to unsubscribe from: 'play', 'pause', 'error',
+   *   'ended', 'waiting', 'playing'
    * @param callback - The exact callback reference that was passed to `on()`
    */
   public off(event: PlayerEvent, callback: (...args: unknown[]) => void): void {
@@ -236,6 +242,12 @@ export class YumYumPlayer {
       },
       () => {
         this.emit('ended');
+      },
+      (buffering) => {
+        // Edge-triggered buffering signal from the controller. Mirror it as the
+        // HTMLMediaElement-style 'waiting' / 'playing' events for consumers.
+        this.buffering = buffering;
+        this.emit(buffering ? 'waiting' : 'playing');
       },
       config.targetFps,
       config.renderFps,
@@ -637,6 +649,15 @@ export class YumYumPlayer {
   /** Get the current playback position in seconds. */
   public getCurrentTime(): number {
     return this.playbackController.getCurrentTime();
+  }
+
+  /**
+   * True while playback is stalled waiting for data (buffering) during PLAYING.
+   * Mirrors the 'waiting' / 'playing' events — an explicit signal so consumers
+   * don't have to detect rebuffering heuristically.
+   */
+  public isBuffering(): boolean {
+    return this.buffering;
   }
 
   /** Get real-time player diagnostics and telemetry */

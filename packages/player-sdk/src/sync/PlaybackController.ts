@@ -58,6 +58,12 @@ export class PlaybackController {
 
   private rafId: number | null = null;
   private isDrawingGap = false;
+  /**
+   * Buffering = stalled during PLAYING (a gap-stall with no fresh frames). Tracked
+   * separately from `isDrawingGap` so we can emit an edge-triggered signal to the
+   * consumer (spinner) instead of polling every frame. False on pause/seek/flush.
+   */
+  private buffering = false;
 
   private lastKeptPts = -1;
   private decodedFramesCount = 0;
@@ -68,6 +74,7 @@ export class PlaybackController {
     private onRenderFrame: ((frame: DecodedFrame['data']) => void) | null,
     private onBackpressureChange: ((pause: boolean) => void) | null,
     private onEnded: (() => void) | null | undefined,
+    private onBufferingChange: ((buffering: boolean) => void) | null | undefined,
     private targetFps: number | undefined,
     private renderFps: number | undefined,
     private lowPower: boolean | undefined,
@@ -85,6 +92,22 @@ export class PlaybackController {
 
   public get hasStarted(): boolean {
     return this.lastRenderedPTS !== -1;
+  }
+
+  /** True while playback is stalled (buffering) during PLAYING. */
+  public get isBuffering(): boolean {
+    return this.buffering;
+  }
+
+  /**
+   * Update the buffering flag and notify the consumer only on a transition —
+   * never per frame. Centralizes the edge-trigger so tick()/pause()/seek()/flush()
+   * all funnel through one place.
+   */
+  private setBuffering(next: boolean): void {
+    if (this.buffering === next) return;
+    this.buffering = next;
+    this.onBufferingChange?.(next);
   }
 
   public getState(): PlaybackState {
@@ -151,6 +174,8 @@ export class PlaybackController {
       this.rafId = null;
     }
     this.audioCtxStartOffset = null;
+    // Leaving PLAYING — clear any buffering signal so the spinner doesn't stick.
+    this.setBuffering(false);
   }
 
   public seek(pts: number) {
@@ -184,6 +209,9 @@ export class PlaybackController {
     this.audioCtxStartOffset = null;
     this.isBackpressurePaused = false;
     this.isDrawingGap = false;
+    // Seek / codec-change clears any in-progress stall — reset buffering so a
+    // stale spinner can't linger across the flush.
+    this.setBuffering(false);
     // The audio pipeline is also flushed on seek/codec-change: re-acquire its
     // clock from scratch (the first valid sample after the flush is adopted).
     this.audioAcquired = false;
@@ -478,6 +506,8 @@ export class PlaybackController {
         }
       }
       this.isDrawingGap = false;
+      // A fresh frame painted — playback is no longer stalled.
+      this.setBuffering(false);
     } else {
       // Gap Detection: if no new frame rendered for >250ms, trigger placeholder frame
       const GAP_THRESHOLD = 0.250; // 250ms
@@ -490,8 +520,11 @@ export class PlaybackController {
           this.isDrawingGap = true;
           // Freeze on the last rendered frame instead of painting a black placeholder to prevent flickering.
           // The UI cell (GridPlayerCell.tsx) handles displaying a non-blocking buffering indicator.
+          // Edge-triggered signal so the consumer can show a buffering spinner.
+          this.setBuffering(true);
         } else {
           this.isDrawingGap = false;
+          this.setBuffering(false);
         }
       }
     }
@@ -521,5 +554,6 @@ export class PlaybackController {
     this.onRenderFrame = null;
     this.onBackpressureChange = null;
     this.onEnded = null;
+    this.onBufferingChange = null;
   }
 }
