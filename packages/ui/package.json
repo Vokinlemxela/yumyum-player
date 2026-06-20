@@ -1,6 +1,6 @@
 {
   "name": "@yumyum-player/ui",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "author": "Vokinlemxela",
   "type": "module",
   "main": "dist/index.js",

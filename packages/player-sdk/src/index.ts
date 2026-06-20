@@ -530,9 +530,14 @@ export class YumYumPlayer {
 
     this.logger.info(`Starting playback (Current state: ${this.lifecycleState})`);
 
-    // Always activate AudioContext so audio flows through the pipeline even
-    // when muted. Gain=0 provides silence; unmuting just raises the gain.
-    await this.audioRenderer.resume();
+    // Activate AudioContext so audio flows through the pipeline even when muted
+    // (gain=0 = silence; unmuting just raises the gain). Fire-and-forget, NOT
+    // awaited: before the first user gesture the browser autoplay policy keeps
+    // the AudioContext suspended and resume()/worklet addModule can reject with
+    // AbortError. Awaiting it here would abort the whole play() — and thus video
+    // — for muted autoplay (allowed by policy). Audio re-resumes on the next
+    // gesture (see setVolume/setMuted/setPlaybackRate, which also call resume()).
+    void this.audioRenderer.resume().catch(() => {});
     this.playbackController.start();
     // `push` loaders stream on connect and treat this as a no-op.
     this.activeLoader?.start(() => this.isBackpressurePaused);
