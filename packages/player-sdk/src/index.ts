@@ -125,6 +125,7 @@ export class YumYumPlayer {
 
   private lifecycleState: PlayerLifecycleState = 'IDLE';
   private lastError: Error | null = null;
+  private audioUnlockCleanup: (() => void) | null = null;
 
   /** Get the current player lifecycle state */
   public get state(): PlayerLifecycleState {
@@ -351,6 +352,8 @@ export class YumYumPlayer {
         this.logger.error(`Failed to install plugin "${plugin.name}":`, err);
       }
     }
+
+    this.setupAutoplayUnlock();
   }
 
   /**
@@ -728,6 +731,53 @@ export class YumYumPlayer {
     return this.activeLoader?.getWallClockRange?.() ?? null;
   }
 
+  private setupAutoplayUnlock(): void {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+
+    const unlock = async (e: Event) => {
+      if (this.lifecycleState === 'DESTROYED') {
+        cleanup();
+        return;
+      }
+
+      if (this.audioRenderer.state === 'running' && this.audioRenderer.isInitializedState) {
+        cleanup();
+        return;
+      }
+
+      this.logger.info(`User gesture (${e.type}) detected, attempting to unlock audio...`);
+      try {
+        await this.audioRenderer.resume();
+        this.logger.info('Audio unlocked successfully on user gesture');
+        cleanup();
+      } catch (err) {
+        this.logger.warn('Failed to unlock audio on user gesture, will retry on next gesture:', err);
+      }
+    };
+
+    const events = ['click', 'pointerdown', 'keydown'];
+    const cleanup = () => {
+      events.forEach(ev => {
+        document.removeEventListener(ev, unlock, { capture: true });
+      });
+    };
+
+    events.forEach(ev => {
+      document.addEventListener(ev, unlock, { capture: true, passive: true });
+    });
+
+    this.audioUnlockCleanup = cleanup;
+  }
+
+  /**
+   * Explicitly attempt to unlock Web Audio context on a user gesture.
+   * Host applications can call this in their click/pointer/key handlers.
+   */
+  public async unlockAudio(): Promise<void> {
+    this.logger.info('Explicit unlockAudio() triggered');
+    await this.audioRenderer.resume();
+  }
+
   /** Destroy the player and release all resources */
   public destroy(): void {
     if (this.lifecycleState === 'DESTROYED') {
@@ -736,6 +786,10 @@ export class YumYumPlayer {
 
     this.logger.info(`Destroying player (Current state: ${this.lifecycleState})`);
     this.pause();
+    if (this.audioUnlockCleanup) {
+      this.audioUnlockCleanup();
+      this.audioUnlockCleanup = null;
+    }
     if (this.activeLoader) {
       this.activeLoader.destroy();
       this.activeLoader = null;

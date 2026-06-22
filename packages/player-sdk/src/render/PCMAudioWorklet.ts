@@ -213,12 +213,18 @@ export class PCMAudioWorklet {
   private gainNode: GainNode | null = null;
   private workletUrl: string | null = null;
   private isInitialized = false;
+  private isWorkletAdded = false;
   private volumeLevel = 1.0;
   private isMuted = false;
 
   /** Whether audio is currently muted (read-only accessor for external consumers) */
   public get isMutedState(): boolean {
     return this.isMuted;
+  }
+
+  /** Whether the AudioWorklet is fully initialized */
+  public get isInitializedState(): boolean {
+    return this.isInitialized;
   }
 
   // Real-time PTS tracking states
@@ -278,56 +284,69 @@ export class PCMAudioWorklet {
     }
 
     try {
-      // The processor source is bundled as a Blob URL (see constructor), so it
-      // ships with the package — no external/same-origin file is required.
-      await this.audioCtx.audioWorklet.addModule(this.workletUrl!);
-      this.logger.debug('AudioWorklet initialized successfully via blob URL');
+      if (!this.isWorkletAdded) {
+        // The processor source is bundled as a Blob URL (see constructor), so it
+        // ships with the package — no external/same-origin file is required.
+        await this.audioCtx.audioWorklet.addModule(this.workletUrl!);
+        this.isWorkletAdded = true;
+        this.logger.debug('AudioWorklet processor module added successfully');
+      }
 
       if (!this.audioCtx) return; // Race condition check
 
-      this.workletNode = new AudioWorkletNode(this.audioCtx, 'pcm-player-processor', {
-        numberOfInputs: 0,
-        numberOfOutputs: 1,
-        outputChannelCount: [2], // Stereo out
-        processorOptions: {
-          bufferSize: 512 * 1024, // 512K samples (~12 seconds of stereo audio)
-        },
-      });
+      if (!this.workletNode) {
+        this.workletNode = new AudioWorkletNode(this.audioCtx, 'pcm-player-processor', {
+          numberOfInputs: 0,
+          numberOfOutputs: 1,
+          outputChannelCount: [2], // Stereo out
+          processorOptions: {
+            bufferSize: 512 * 1024, // 512K samples (~12 seconds of stereo audio)
+          },
+        });
 
-      // Handle PTS and buffer updates from audio worklet thread
-      this.workletNode.port.onmessage = (event) => {
-        const msg = event.data as { type: string; playPts: number; available: number };
-        if (msg && msg.type === 'PLAY_STATUS') {
-          this.lastReportedPlayPts = msg.playPts;
-          this.audioBufferAvailable = msg.available;
-          if (msg.available === 0) {
-            // Underrun: audioCtx.currentTime keeps advancing while no samples are
-            // consumed, so the anchored master clock would overshoot and then snap
-            // back when audio resumes. Drop the anchor now; the first report after
-            // refill re-anchors at the true play position (no jump).
-            this.masterClock.reset();
-          } else {
-            this.updateClockAnchor(msg.playPts);
+        // Handle PTS and buffer updates from audio worklet thread
+        this.workletNode.port.onmessage = (event) => {
+          const msg = event.data as { type: string; playPts: number; available: number };
+          if (msg && msg.type === 'PLAY_STATUS') {
+            this.lastReportedPlayPts = msg.playPts;
+            this.audioBufferAvailable = msg.available;
+            if (msg.available === 0) {
+              // Underrun: audioCtx.currentTime keeps advancing while no samples are
+              // consumed, so the anchored master clock would overshoot and then snap
+              // back when audio resumes. Drop the anchor now; the first report after
+              // refill re-anchors at the true play position (no jump).
+              this.masterClock.reset();
+            } else {
+              this.updateClockAnchor(msg.playPts);
+            }
+            // The ring buffer just drained a little — top the lead back up if any
+            // fallback batches are queued (see the lead gate in pumpFallbackDecodes).
+            if (this.fallbackPending.length > 0) this.pumpFallbackDecodes();
           }
-          // The ring buffer just drained a little — top the lead back up if any
-          // fallback batches are queued (see the lead gate in pumpFallbackDecodes).
-          if (this.fallbackPending.length > 0) this.pumpFallbackDecodes();
-        }
-      };
+        };
+      }
 
-      this.gainNode = this.audioCtx.createGain();
-      // Apply current mute state immediately — gain=0 when muted so audio
-      // always flows through the pipeline but produces silence when muted.
-      const initialGain = this.isMuted ? 0 : this.volumeLevel;
-      this.gainNode.gain.setValueAtTime(initialGain, this.audioCtx.currentTime);
+      if (!this.gainNode) {
+        this.gainNode = this.audioCtx.createGain();
+        // Apply current mute state immediately — gain=0 when muted so audio
+        // always flows through the pipeline but produces silence when muted.
+        const initialGain = this.isMuted ? 0 : this.volumeLevel;
+        this.gainNode.gain.setValueAtTime(initialGain, this.audioCtx.currentTime);
 
-      this.workletNode.connect(this.gainNode);
-      this.gainNode.connect(this.audioCtx.destination);
+        this.workletNode.connect(this.gainNode);
+        this.gainNode.connect(this.audioCtx.destination);
+      }
 
       this.isInitialized = true;
       this.logger.debug('AudioWorklet initialized successfully');
-    } catch (err) {
-      this.logger.error('Failed to initialize AudioWorklet:', err);
+    } catch (err: any) {
+      const isAutoplayBlock = err && (err.name === 'AbortError' || (err.message && err.message.includes('worklet'))) && 
+                              (this.audioCtx?.state === 'suspended');
+      if (isAutoplayBlock) {
+        this.logger.warn('AudioWorklet initialization was blocked by browser autoplay policy (suspended). Will retry on user gesture.', err);
+      } else {
+        this.logger.error('Failed to initialize AudioWorklet:', err);
+      }
       throw err;
     }
   }
@@ -475,15 +494,15 @@ export class PCMAudioWorklet {
       await this.initialize(this.lastSeenSampleRate);
     }
 
-    // 4. Handle the resumption promise asynchronously without blocking player startup
+    // 4. Await the resumption promise to ensure the state actually changes
     if (resumePromise) {
-      resumePromise
-        .then(() => {
-          this.logger.debug(`AudioContext resumed successfully. State: ${this.audioCtx?.state}`);
-        })
-        .catch((err) => {
-          this.logger.warn('AudioContext resume failed or was blocked:', err);
-        });
+      try {
+        await resumePromise;
+        this.logger.debug(`AudioContext resumed successfully. State: ${this.audioCtx?.state}`);
+      } catch (err) {
+        this.logger.warn('AudioContext resume failed or was blocked:', err);
+        throw err;
+      }
     }
   }
 

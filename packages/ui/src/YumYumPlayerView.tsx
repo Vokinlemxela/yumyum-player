@@ -44,6 +44,7 @@ export interface PlayerHandle {
   };
   on(event: string, callback: (...args: unknown[]) => void): void;
   off(event: string, callback: (...args: unknown[]) => void): void;
+  unlockAudio?(): Promise<void>;
   destroy(): void;
 }
 
@@ -462,6 +463,7 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
   const togglePlay = useCallback(() => {
     const p = playerRef.current;
     if (!p || hasError) return;
+    p.unlockAudio?.().catch(() => {});
     if (isPlaying) { p.pause(); setIsPlaying(false); }
     else { p.play().then(() => setIsPlaying(true)).catch(() => {}); }
   }, [isPlaying, hasError]);
@@ -474,7 +476,11 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
     writeStore(K('volume'), vol);
     writeStore(K('muted'), isMute);
     const p = playerRef.current;
-    if (p) { p.mute(isMute); p.setVolume(vol); }
+    if (p) {
+      p.unlockAudio?.().catch(() => {});
+      p.mute(isMute);
+      p.setVolume(vol);
+    }
   }, [K]);
 
   const toggleMute = useCallback(() => {
@@ -482,7 +488,11 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
     setMuted(next);
     writeStore(K('muted'), next);
     const p = playerRef.current;
-    if (p) { p.mute(next); p.setVolume(next ? 0 : volume || 0.5); }
+    if (p) {
+      p.unlockAudio?.().catch(() => {});
+      p.mute(next);
+      p.setVolume(next ? 0 : volume || 0.5);
+    }
     if (!next && (volume || 0) === 0) applyVolume(0.5);
   }, [muted, volume, K, applyVolume]);
 
