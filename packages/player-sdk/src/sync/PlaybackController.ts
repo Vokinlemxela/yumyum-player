@@ -364,10 +364,10 @@ export class PlaybackController {
       return;
     }
 
-    // Real-time synchronization & catch-up for live streams (Infinity duration)
-    if (this.duration === Infinity && this.frameQueue.length > 0) {
-      // 1. Queue size catch-up: if queue size exceeds 45 frames (~1.5s lag), discard old ones to jump to live edge
-      if (this.frameQueue.length > 45) {
+    // Real-time synchronization & catch-up
+    if (this.lastRenderedPTS !== -1 && this.frameQueue.length > 0) {
+      // 1. Queue size catch-up (Live streams only)
+      if (this.duration === Infinity && this.frameQueue.length > 45) {
         const dropCount = this.frameQueue.length - 5;
         const droppedFrames = this.frameQueue.splice(0, dropCount);
         for (const dropped of droppedFrames) {
@@ -385,8 +385,15 @@ export class PlaybackController {
       // 2. Clock drift correction: keep the clock locked closely to the enqueued frame's PTS
       const firstFrame = this.frameQueue[0];
       const clockDiff = firstFrame.pts - currentClock;
-      // If clock is ahead by more than 40ms or behind by more than 80ms, align clock instantly
-      if (clockDiff < -0.040 || clockDiff > 0.080) {
+      
+      // For live streams, correct both ways (if clock is ahead by >40ms or behind by >80ms).
+      // For VOD streams, only correct if the clock is ahead (drifted ahead) by >40ms (clockDiff < -0.040),
+      // to avoid dropping frames as late. Do not pull the clock forward if it is behind.
+      const shouldCorrect = this.duration === Infinity
+        ? (clockDiff < -0.040 || clockDiff > 0.080)
+        : (clockDiff < -0.040);
+
+      if (shouldCorrect) {
         this.mediaStartClock = firstFrame.pts;
         this.playStartTime = performance.now() / 1000;
         

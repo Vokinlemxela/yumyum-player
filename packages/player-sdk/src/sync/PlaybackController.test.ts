@@ -328,4 +328,84 @@ describe('PlaybackController playback rate', () => {
       expect(diag.effectiveFps).toBe(1); // One frame rendered in the last second
     });
   });
+
+  describe('VOD synchronization and clock drift correction', () => {
+    it('aligns the clock back for VOD streams when it has drifted ahead (stalled queue) to prevent frame drop', () => {
+      const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+      let renderedFrame: any = null;
+      const c = new PlaybackController(
+        null,
+        (frame) => { renderedFrame = frame; },
+        null,
+        null,
+        null,
+        undefined,
+        undefined,
+        undefined,
+        new Logger('test', 'silent')
+      );
+      c.duration = 100; // VOD stream
+      c.start();
+
+      // Render the first frame to exit the initial lazy alignment state
+      const f1Data = { close: vi.fn() };
+      const f1 = { pts: 0.0, duration: 0.04, data: f1Data as any };
+      c.enqueueFrame(f1);
+      (c as any).tick();
+      expect(renderedFrame).toBe(f1Data);
+      renderedFrame = null;
+
+      // Advance the performance clock by 3 seconds, mimicking a decoder/network stall
+      now.mockReturnValue(4000);
+
+      // Now the clock has progressed to 3.0s, but the next frame is at 0.04s.
+      // Without clock drift correction, delta = 0.04 - 3.0 = -2.96, which is < -0.100 (discarded as late).
+      // With our fix, the clock is adjusted back to 0.04, and the frame is rendered.
+      const f2Data = { close: vi.fn() };
+      const f2 = { pts: 0.04, duration: 0.04, data: f2Data as any };
+      c.enqueueFrame(f2);
+      (c as any).tick();
+
+      expect(renderedFrame).toBe(f2Data);
+      expect(c.getCurrentTime()).toBeCloseTo(0.04, 6);
+    });
+
+    it('does not align the clock forward for VOD streams if the clock is behind (waiting for future frames)', () => {
+      const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+      let renderedFrame: any = null;
+      const c = new PlaybackController(
+        null,
+        (frame) => { renderedFrame = frame; },
+        null,
+        null,
+        null,
+        undefined,
+        undefined,
+        undefined,
+        new Logger('test', 'silent')
+      );
+      c.duration = 100; // VOD stream
+      c.start();
+
+      // Render the first frame to exit the initial lazy alignment state
+      const f1Data = { close: vi.fn() };
+      const f1 = { pts: 0.0, duration: 0.04, data: f1Data as any };
+      c.enqueueFrame(f1);
+      (c as any).tick();
+      expect(renderedFrame).toBe(f1Data);
+      renderedFrame = null;
+
+      // Enqueue a frame that is in the future (e.g. 1.0s, while the clock is at 0.0s)
+      const f2Data = { close: vi.fn() };
+      const f2 = { pts: 1.0, duration: 0.04, data: f2Data as any };
+      c.enqueueFrame(f2);
+      (c as any).tick();
+
+      // The clock should NOT align forward to 1.0s. It should stay at 0.0s.
+      // So f2 should not be rendered yet.
+      expect(renderedFrame).toBeNull();
+      expect(c.getCurrentTime()).toBeCloseTo(0.0, 6);
+    });
+  });
 });
+

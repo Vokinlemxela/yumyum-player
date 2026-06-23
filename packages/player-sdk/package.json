@@ -1,7 +1,7 @@
 {
   "name": "@yumyum-player/core",
-  "version": "0.1.12",
-  "description": "Yum-yum Player — Multi-codec browser video player engine. H.264, HEVC/H.265, MJPEG with WebCodecs + WebGL2 rendering.",
+  "version": "0.1.13",
+  "description": "Yum-yum Player — low-latency multi-codec browser video player engine for streaming, CCTV/VMS and video walls. H.264, HEVC/H.265, MJPEG via WebCodecs + WebGL2, HLS & MPEG-TS.",
   "license": "MIT",
   "author": "Vokinlemxela",
   "repository": {
@@ -47,6 +47,16 @@
     "mpeg-ts",
     "mjpeg",
     "browser-player",
+    "low-latency",
+    "ultra-low-latency",
+    "live-streaming",
+    "webgl2",
+    "video-decoder",
+    "cctv",
+    "video-surveillance",
+    "vms",
+    "rtsp",
+    "video-wall",
     "yumyum"
   ],
   "scripts": {
