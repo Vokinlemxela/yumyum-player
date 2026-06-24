@@ -83,7 +83,7 @@ export interface YumYumPlayerViewProps {
   onReady?: (player: PlayerHandle | null) => void;
 }
 
-const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 4, 16];
 
 const STRINGS = {
   ru: { speed: 'Скорость', normal: 'Обычная', autoplay: 'Автовоспроизведение', loop: 'Повтор', live: 'В ЭФИРЕ', settings: 'Настройки', on: 'Вкл', off: 'Выкл', noVideo: 'Видео отсутствует' },

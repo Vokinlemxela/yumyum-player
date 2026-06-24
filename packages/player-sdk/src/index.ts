@@ -33,6 +33,23 @@ import {
 import { DEMUXER_WORKER_SOURCE } from './demux/DemuxerWorkerInline.js';
 import { Logger, LogLevel } from './utils/Logger.js';
 
+// ─── Keyframe-only Decode Gate ──────────────────────────────────────
+
+/**
+ * Determines whether a video frame should be decoded at the given playback rate.
+ * At speeds >= 4×, only keyframes are decoded to prevent decoder overload.
+ *
+ * @param playbackRate - Current playback speed multiplier.
+ * @param isKeyframe   - Whether the packet is a keyframe (IDR / I-frame).
+ * @returns `true` if the frame should be decoded, `false` if it should be discarded.
+ */
+export function shouldDecodeFrame(playbackRate: number, isKeyframe: boolean): boolean {
+  if (playbackRate >= 4 && !isKeyframe) {
+    return false;
+  }
+  return true;
+}
+
 // ─── Public API Types ───────────────────────────────────────────────
 
 export interface PlayerConfig {
@@ -406,6 +423,12 @@ export class YumYumPlayer {
           'Enable it via: new YumYumPlayer({ canvas, plugins: [proStreaming()] }).'
         );
       }
+      if ((scheme === 'whep' || scheme === 'whep+https') && !this.loaderRegistry.has(scheme)) {
+        throw new Error(
+          'Low-latency WebRTC/WHEP streaming requires the @yumyum-player/transport-webrtc plugin. ' +
+          'Enable it via: new YumYumPlayer({ canvas, plugins: [transportWebrtc()] }).'
+        );
+      }
       const loader = this.loaderRegistry.create(url, this.loaderDeps);
       if (!loader) {
         throw new Error(`No stream loader is registered for "${scheme}://" URLs.`);
@@ -473,6 +496,9 @@ export class YumYumPlayer {
           }
 
           if (type === 'VIDEO') {
+            if (!shouldDecodeFrame(this.getPlaybackRate(), isKeyframe)) {
+              return; // Discard non-keyframes at high speed (>= 4x) to unload the decoder
+            }
             const decoder = this.decoders.get(codec);
             if (decoder) {
               decoder.decode(data, Math.floor(pts * 1000000), isKeyframe, e.data.parsedCodec, e.data.description);
@@ -625,14 +651,14 @@ export class YumYumPlayer {
   }
 
   /** Allowed playback speeds, matching the UI speed menu. */
-  private static readonly PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+  private static readonly PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 4, 16];
 
   /**
    * Set the playback speed. The value is clamped to the supported set.
    * Audio is not time-stretched, so non-1x speeds mute audio automatically;
    * returning to 1x restores the user's own mute preference.
    *
-   * @param rate - Desired speed multiplier (e.g. 0.5, 1, 1.5, 2)
+   * @param rate - Desired speed multiplier (e.g. 0.5, 1, 2, 4, 16)
    */
   public setPlaybackRate(rate: number): void {
     // Snap to the nearest supported rate so the clock and UI stay in sync.

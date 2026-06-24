@@ -125,6 +125,62 @@ describe('PlaybackController playback rate', () => {
     expect(c.getCurrentTime()).toBeCloseTo(10.5, 6);
   });
 
+  it('advances 4× as fast at 4x', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+    const c = makeController();
+    c.start();
+    c.setPlaybackRate(4);
+    now.mockReturnValue(3000); // +2s real
+    expect(c.getCurrentTime()).toBeCloseTo(8, 6); // scaled 4x
+  });
+
+  it('advances 16× as fast at 16x', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+    const c = makeController();
+    c.start();
+    c.setPlaybackRate(16);
+    now.mockReturnValue(2000); // +1s real
+    expect(c.getCurrentTime()).toBeCloseTo(16, 6); // scaled 16x
+  });
+
+  it('preserves position when switching from 1x to 4x mid-playback', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+    const c = makeController();
+    c.start();
+    now.mockReturnValue(3000); // +2s at 1x → pos 2
+    expect(c.getCurrentTime()).toBeCloseTo(2, 6);
+    c.setPlaybackRate(4); // re-anchor at pos 2
+    expect(c.getCurrentTime()).toBeCloseTo(2, 6); // no jump
+    now.mockReturnValue(4000); // +1s real at 4x → +4 → 6
+    expect(c.getCurrentTime()).toBeCloseTo(6, 6);
+  });
+
+  it('preserves position when switching from 4x to 16x mid-playback', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+    const c = makeController();
+    c.start();
+    c.setPlaybackRate(4);
+    now.mockReturnValue(2000); // +1s at 4x → pos 4
+    expect(c.getCurrentTime()).toBeCloseTo(4, 6);
+    c.setPlaybackRate(16); // re-anchor at pos 4
+    expect(c.getCurrentTime()).toBeCloseTo(4, 6); // no jump
+    now.mockReturnValue(3000); // +1s real at 16x → +16 → 20
+    expect(c.getCurrentTime()).toBeCloseTo(20, 6);
+  });
+
+  it('preserves position when switching from 16x back to 1x', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+    const c = makeController();
+    c.start();
+    c.setPlaybackRate(16);
+    now.mockReturnValue(1500); // +0.5s at 16x → pos 8
+    expect(c.getCurrentTime()).toBeCloseTo(8, 6);
+    c.setPlaybackRate(1); // re-anchor at pos 8
+    expect(c.getCurrentTime()).toBeCloseTo(8, 6); // no jump
+    now.mockReturnValue(2500); // +1s real at 1x → +1 → 9
+    expect(c.getCurrentTime()).toBeCloseTo(9, 6);
+  });
+
   it('rejects non-positive / non-finite rates', () => {
     const c = makeController();
     c.setPlaybackRate(0);
