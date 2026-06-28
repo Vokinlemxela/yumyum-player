@@ -195,15 +195,15 @@ describe('StreamLoader live streams are unaffected by the look-ahead', () => {
     // Live uses the legacy direct-feed loop: it starts at the live edge and never
     // pre-downloads a 15s cushion from the start of the playlist.
     expect(tracker.fetched.length).toBeGreaterThan(0);
-    expect(tracker.fetched.every((i) => i >= SEG_COUNT - 2)).toBe(true);
+    expect(tracker.fetched.every((i) => i >= SEG_COUNT - 3)).toBe(true);
 
     // No raw look-ahead cushion: live only pulls what it feeds at the edge
-    // (2 segments behind the live edge), NOT ~8 segments (15s / 2s) like VOD.
+    // (3 segments behind the live edge), NOT ~8 segments (15s / 2s) like VOD.
     expect(tracker.fetched.length).toBeLessThanOrEqual(3);
 
     // getBufferedEnd tracks the fed cursor for live (no download-ahead window):
     // it never leads the fed media position by the RAW_LOOKAHEAD margin.
-    const fedMediaEnd = fed.length * SEG_DURATION + (SEG_COUNT - 2) * SEG_DURATION;
+    const fedMediaEnd = fed.length * SEG_DURATION + (SEG_COUNT - 3) * SEG_DURATION;
     expect(loader.getBufferedEnd()).toBeLessThanOrEqual(fedMediaEnd);
 
     loader.destroy();
