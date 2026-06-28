@@ -316,9 +316,9 @@ export class StreamLoader implements IStreamLoader {
       // Fresh segments array — invalidate the prefix-sum cache.
       this.markSegmentsDirty();
 
-      // If it is a live stream, seek to the active edge (second to last segment) on first load
+      // If it is a live stream, seek to the active edge (third to last segment) on first load
       if (this.isLive && this.segments.length > 0) {
-        this.currentSegmentIndex = Math.max(0, this.segments.length - 2);
+        this.currentSegmentIndex = Math.max(0, this.segments.length - 3);
         this.logger.debug(`Live stream detected. Starting playback from active edge segment index: ${this.currentSegmentIndex}`);
       }
     } else {
@@ -573,11 +573,12 @@ export class StreamLoader implements IStreamLoader {
     }
 
     if (this.isLive && this.segments.length > 0) {
-      const maxBehind = 2;
+      const maxBehind = 4;
       const liveEdgeIndex = Math.max(0, this.segments.length - 1);
       if (liveEdgeIndex - this.currentSegmentIndex > maxBehind) {
-        this.logger.warn(`Live streaming lag detected (currently at ${this.currentSegmentIndex}, latest is ${this.segments.length - 1}). Fast-forwarding directly to live edge index: ${liveEdgeIndex}`);
-        this.currentSegmentIndex = liveEdgeIndex;
+        const safeTargetIndex = Math.max(0, this.segments.length - 3);
+        this.logger.warn(`Live streaming lag detected (currently at ${this.currentSegmentIndex}, latest is ${this.segments.length - 1}). Fast-forwarding to safe buffer index: ${safeTargetIndex}`);
+        this.currentSegmentIndex = safeTargetIndex;
       }
     }
 
@@ -654,10 +655,10 @@ export class StreamLoader implements IStreamLoader {
               // Refresh playlist and jump to the live edge.
               this.logger.warn(`Too many 404s in sequence (${this.consecutiveFailures}). Resyncing to live edge...`);
               await this.refreshPlaylist();
-              // Jump to the latest available segment (live edge)
+              // Jump to the latest available segment (safe buffer edge)
               if (this.segments.length > 0) {
-                this.currentSegmentIndex = Math.max(0, this.segments.length - 1);
-                this.logger.debug(`Resynced to live edge at segment index: ${this.currentSegmentIndex}`);
+                this.currentSegmentIndex = Math.max(0, this.segments.length - 3);
+                this.logger.debug(`Resynced to safe buffer edge at segment index: ${this.currentSegmentIndex}`);
               }
               this.consecutiveFailures = 0;
             }
