@@ -1,6 +1,6 @@
 {
   "name": "@yumyum-player/core",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Yum-yum Player — low-latency multi-codec browser video player engine for streaming, CCTV/VMS and video walls. H.264, HEVC/H.265, MJPEG via WebCodecs + WebGL2, HLS & MPEG-TS.",
   "license": "MIT",
   "author": "Vokinlemxela",

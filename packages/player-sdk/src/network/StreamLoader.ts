@@ -883,6 +883,10 @@ export class StreamLoader implements IStreamLoader, QualitySource {
     return starts[this.segments.length];
   }
 
+  public getConnectionState(): string {
+    return this.isDegradedMode ? 'reconnecting' : 'connected';
+  }
+
   // ─── Wall-clock (PROGRAM-DATE-TIME) timeline ────────────────────────
   // Available only for archive VOD. PROGRAM-DATE-TIME is the single source of
   // truth for absolute time; synthetic media time is continuous (gaps collapse)

@@ -243,6 +243,9 @@ export class YumYumPlayer {
       playerQualitySource,
       this.logger.createChild('QualityController')
     );
+    this.qualityController.onQualitySwitch = (id) => {
+      this.emit('qualitychange', id);
+    };
 
     // 1. Initialize Video WebGL2 Renderer
     this.videoRenderer = new WebGLVideoRenderer(config.canvas, config.placeholderStyle || 'black', this.logger.createChild('WebGLVideoRenderer'));
