@@ -843,8 +843,11 @@ const SettingsMenu: React.FC<{
       <span style={{ fontWeight: 700, fontSize: 10, color: on ? accent : '#888' }}>{on ? t.on : t.off}</span>
     </Button>
   );
-  
+
   const hasMultipleLevels = qualityLevels.length > 0;
+  const mappedActive = activeQuality === 'auto'
+    ? 'auto'
+    : (qualityLevels.find(l => l.id === activeQuality)?.kind || activeQuality);
 
   return (
     <div className="yyv-menu">
@@ -855,33 +858,30 @@ const SettingsMenu: React.FC<{
         <>
           <div className="yyv-sep" />
           <div className="yyv-mlabel">{t.quality}</div>
-          <select
-            value={activeQuality}
-            onChange={(e) => onQuality(e.target.value)}
-            className="yyp-select"
-            style={{
-              width: '100%',
-              margin: '6px 0',
-              padding: '6px',
-              background: '#000',
-              color: '#fff',
-              border: `1px solid ${accent}`,
-              borderRadius: '4px',
-              fontFamily: 'ui-monospace,SF Mono,Menlo,monospace',
-              fontSize: '11px',
-              outline: 'none',
-              cursor: 'pointer'
-            }}
-          >
-            <option value="auto">Auto</option>
-            <option value="main">Main (High)</option>
-            <option value="sub">Sub (Low)</option>
-            {qualityLevels.map((lvl) => (
-              <option key={lvl.id} value={lvl.id}>
-                {lvl.label}
-              </option>
-            ))}
-          </select>
+          <div style={{ padding: '0 12px 6px 12px', boxSizing: 'border-box' }}>
+            <select
+              value={mappedActive}
+              onChange={(e) => onQuality(e.target.value)}
+              className="yyp-select"
+              style={{
+                width: '100%',
+                padding: '6px 8px',
+                background: '#161616',
+                color: '#fff',
+                border: '1px solid rgba(255, 255, 255, 0.15)',
+                borderRadius: '4px',
+                font: 'inherit',
+                fontSize: '11px',
+                outline: 'none',
+                cursor: 'pointer',
+                boxSizing: 'border-box'
+              }}
+            >
+              <option value="auto">Auto</option>
+              <option value="main">Main (High)</option>
+              <option value="sub">Sub (Low)</option>
+            </select>
+          </div>
         </>
       )}
 

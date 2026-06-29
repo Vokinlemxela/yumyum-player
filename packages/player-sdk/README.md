@@ -51,9 +51,10 @@ Try it with no server using the built-in synthetic streams:
 | Video (hardware, WebCodecs) | **H.264 / AVC**, **HEVC / H.265** *(where the browser decodes it natively)*, **MJPEG** |
 | Audio | **AAC** — native `AudioDecoder` with a dual strategy (raw-frame + ADTS) and a Web Audio (`decodeAudioData`) fallback for browsers without native AAC; resampled PCM played through an `AudioWorklet` |
 | Transport | **HLS** (MPEG-TS *and* fMP4 segments), `mock://` test streams |
-| Rendering | **WebGL2** YUV shaders, automatic 2D-canvas fallback |
-| A/V sync | audio-mastered clock anchored to the audio hardware time (smooth, monotonic) |
-| Resilience | decoder hot-recovery & profile (SPS/PPS) switching, frame-queue backpressure, MPEG-TS sync-byte segment validation, live-edge recovery |
+| Adaptive (ABR) | multi-variant HLS / Main-Sub renditions with a closed-loop quality controller (throughput + decode-headroom, hysteresis), `auto`/`manual` modes and a grid-density ceiling |
+| Rendering | **WebGL2** YUV shaders with a process-wide context budget (auto-demote to 2D / `lowPower` on big walls), automatic 2D-canvas fallback |
+| A/V sync | single audio-mastered clock anchored to the audio hardware time (smooth, monotonic) with a dead-band + correction cooldown |
+| Resilience | 24/7 live reconnect (unbounded, jittered backoff) + bounded HLS 404-resync, decoder hot-recovery & profile (SPS/PPS) switching, frame-queue backpressure, MPEG-TS sync-byte segment validation, live-edge recovery |
 
 Demuxing of MPEG-TS/fMP4 (including extracting AAC audio and H.264/HEVC NAL
 units) is **entirely in the free core**. Live WebSocket transport (`ws://`/`wss://`)
@@ -72,6 +73,9 @@ new YumYumPlayer({
   placeholderStyle: 'black',    // 'black' | 'no-signal' | 'none' — shown on signal gap
   logLevel: 'silent',           // 'silent' | 'error' | 'warn' | 'info' | 'debug'
   forceSoftwareHevc: false,     // prefer a registered 'h265-sw' decoder over native HEVC
+  targetFps: 8,                 // skip frames to target specific fps, default: undefined (off)
+  renderFps: 8,                 // restrict rendering loop frequency, default: undefined (off)
+  lowPower: false,              // preset for economical grid tile settings (targetFps=8, renderFps=8, minimal buffer)
   plugins: [],                  // extension modules (see Plugins / Commercial add-ons)
 });
 ```
@@ -82,29 +86,46 @@ new YumYumPlayer({
 
 ```ts
 // Lifecycle
-await player.load(url);        // HLS .m3u8, mock://h264|hevc|mjpeg (ws:// needs a plugin)
+await player.load(url);        // HLS .m3u8, mock://h264|hevc|mjpeg (ws://, WHEP need plugins)
 await player.play();
 player.pause();
 player.seek(seconds);          // no-op on live streams
 player.destroy();              // releases worker, decoders, WebGL and audio
 
-// Audio
+// Audio & Unlocking
 player.setVolume(0.5);         // 0..1
 player.mute(true);
+await player.unlockAudio();    // explicitly unlock Web Audio context on a user gesture
 
-// Speed
+// Speed & Low Power
 player.setPlaybackRate(1.5);   // scales the master clock; audio is muted at ≠ 1×
 player.getPlaybackRate();      // → number
+player.setLowPower(true);      // dynamically toggle economical lowPower mode
 
-// Time & info
+// Quality & ABR (Adaptive Bitrate)
+player.getQualityLevels();     // → QualityLevel[] { id, name, resolution, width, height, bitrate, kind: 'main' | 'sub' }
+player.getActiveQuality();     // → active level ID or 'auto'
+await player.setQuality('sub');// set quality level ID, alias ('main' | 'sub'), or 'auto'
+player.getQualityMode();       // → 'auto' | 'manual'
+player.setQualityMode('auto'); // set ABR mode
+player.getMaxQualityKind();    // → 'main' | 'sub' | null
+player.setMaxQualityKind('sub');// restrict ABR ceiling (e.g. for grid density limits)
+
+// Time, Timeline & Coverage
 player.getCurrentTime();       // seconds (master clock)
 player.getDuration();          // seconds (Infinity for live)
 player.getBufferedEnd();       // furthest buffered media position (s)
+player.isBuffering();          // → boolean (true if playback is currently stalled waiting for data)
+player.getWallClockTime();     // → number | null (absolute epoch ms from PROGRAM-DATE-TIME)
+player.seekToWallClock(ms);    // → boolean (seek to absolute wall-clock epoch ms)
+player.getCoverage();          // → WallClockRange { startMs, endMs, gaps: { startMs, endMs }[] } | null
 player.getTelemetry();         // see fields below
 player.state;                  // 'IDLE' | 'LOADING' | 'LOADED' | 'PLAYING' | 'PAUSED' | 'DESTROYED'
 
 // Events
-player.on('play' | 'pause' | 'ended' | 'error', cb);
+// Subscriptions support: 'play', 'pause', 'ended', 'error', 'waiting' (stalled),
+// 'playing' (stalled recovery), 'qualitychange', 'signals', 'renderfallback'
+player.on('qualitychange', (id) => console.log('Quality changed to:', id));
 player.off(event, cb);
 ```
 
@@ -112,11 +133,19 @@ player.off(event, cb);
 
 ```ts
 {
-  activeCodec, decodingStrategy,        // e.g. 'h265', 'hardware' | 'software'
+  activeCodec, decodingStrategy,        // e.g. 'h264' | 'h265' | 'mjpeg', 'WebCodecs (GPU)' | 'WASM Fallback'
   playbackState, playbackRate,
   currentPTS, duration, bufferedEnd,
-  renderedFrames, droppedFrames, queueLength,
+  renderedFrames, droppedFrames, decodedFrames,
+  effectiveFps, queueLength,
   backpressureActive,
+  throughputKbps,                       // network throughput in Kbps (EWMA)
+  qualityMode,                          // 'auto' | 'manual'
+  lastSwitchReason,                     // e.g. 'throughput_drop', 'low_power_restriction'
+  maxAllowedKind,                       // 'main' | 'sub' | null
+  renderMode,                           // rendering mode ('WebGL2' | '2D fallback')
+  connectionState,                      // loader state ('connected' | 'reconnecting' | 'disconnected')
+  lastError,
 }
 ```
 

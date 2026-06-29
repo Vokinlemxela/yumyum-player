@@ -74,6 +74,9 @@ new YumYumPlayer({
   placeholderStyle: 'black',    // 'black' | 'no-signal' | 'none' — при потере сигнала
   logLevel: 'silent',           // 'silent' | 'error' | 'warn' | 'info' | 'debug'
   forceSoftwareHevc: false,     // предпочесть зарегистрированный 'h265-sw' нативному HEVC
+  targetFps: 8,                 // пропускать кадры для достижения целевой частоты (FPS), по умолчанию: undefined (выкл)
+  renderFps: 8,                 // ограничить частоту цикла рендеринга, по умолчанию: undefined (выкл)
+  lowPower: false,              // пресет для экономичных настроек плиток сетки (targetFps=8, renderFps=8, минимальный буфер)
   plugins: [],                  // модули-расширения (см. Плагины / Коммерческие дополнения)
 });
 ```
@@ -84,29 +87,46 @@ new YumYumPlayer({
 
 ```ts
 // Жизненный цикл
-await player.load(url);        // HLS .m3u8, mock://h264|hevc|mjpeg (ws:// требует плагин)
+await player.load(url);        // HLS .m3u8, mock://h264|hevc|mjpeg (ws://, WHEP требуют плагинов)
 await player.play();
 player.pause();
 player.seek(seconds);          // no-op на live-потоках
 player.destroy();              // освобождает worker, декодеры, WebGL и аудио
 
-// Аудио
+// Аудио и разблокировка
 player.setVolume(0.5);         // 0..1
 player.mute(true);
+await player.unlockAudio();    // явно пытается разблокировать Web Audio Context по жесту пользователя
 
-// Скорость
+// Скорость и Экономичный режим
 player.setPlaybackRate(1.5);   // масштабирует мастер-часы; на ≠ 1× звук приглушается
 player.getPlaybackRate();      // → number
+player.setLowPower(true);      // динамически переключает экономичный режим lowPower
 
-// Время и информация
+// Качество и ABR (авто-битрейт)
+player.getQualityLevels();     // → QualityLevel[] { id, name, resolution, width, height, bitrate, kind: 'main' | 'sub' }
+player.getActiveQuality();     // → активный ID уровня качества или 'auto'
+await player.setQuality('sub');// установить уровень качества по ID, алиасу ('main' | 'sub') или 'auto'
+player.getQualityMode();       // → 'auto' | 'manual'
+player.setQualityMode('auto'); // установить режим ABR
+player.getMaxQualityKind();    // → 'main' | 'sub' | null
+player.setMaxQualityKind('sub');// ограничить верхнюю планку ABR (напр. для лимитов плотности сетки)
+
+// Время, таймлайн и покрытие
 player.getCurrentTime();       // секунды (мастер-часы)
 player.getDuration();          // секунды (Infinity для live)
 player.getBufferedEnd();       // самая дальняя забуференная позиция (с)
+player.isBuffering();          // → boolean (true, если воспроизведение в данный момент приостановлено из-за буферизации)
+player.getWallClockTime();     // → number | null (абсолютное астрономическое время в мс из PROGRAM-DATE-TIME)
+player.seekToWallClock(ms);    // → boolean (переход на абсолютное астрономическое время в мс)
+player.getCoverage();          // → WallClockRange { startMs, endMs, gaps: { startMs, endMs }[] } | null
 player.getTelemetry();         // поля ниже
 player.state;                  // 'IDLE' | 'LOADING' | 'LOADED' | 'PLAYING' | 'PAUSED' | 'DESTROYED'
 
 // События
-player.on('play' | 'pause' | 'ended' | 'error', cb);
+// Поддерживаются: 'play', 'pause', 'ended', 'error', 'waiting' (буферизация),
+// 'playing' (восстановление после буферизации), 'qualitychange', 'signals', 'renderfallback'
+player.on('qualitychange', (id) => console.log('Качество изменено на:', id));
 player.off(event, cb);
 ```
 
@@ -114,11 +134,19 @@ player.off(event, cb);
 
 ```ts
 {
-  activeCodec, decodingStrategy,        // напр. 'h265', 'hardware' | 'software'
+  activeCodec, decodingStrategy,        // напр. 'h264' | 'h265' | 'mjpeg', 'WebCodecs (GPU)' | 'WASM Fallback'
   playbackState, playbackRate,
   currentPTS, duration, bufferedEnd,
-  renderedFrames, droppedFrames, queueLength,
+  renderedFrames, droppedFrames, decodedFrames,
+  effectiveFps, queueLength,
   backpressureActive,
+  throughputKbps,                       // сетевая пропускная способность в Kbps (EWMA)
+  qualityMode,                          // 'auto' | 'manual'
+  lastSwitchReason,                     // напр. 'throughput_drop', 'low_power_restriction'
+  maxAllowedKind,                       // 'main' | 'sub' | null
+  renderMode,                           // режим рендеринга ('WebGL2' | '2D fallback')
+  connectionState,                      // статус подключения лоадера ('connected' | 'reconnecting' | 'disconnected')
+  lastError,
 }
 ```
 
