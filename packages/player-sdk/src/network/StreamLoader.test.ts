@@ -178,6 +178,7 @@ describe('StreamLoader live streams are unaffected by the look-ahead', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   it('feeds live segments directly from the live edge without a raw look-ahead', async () => {
@@ -195,15 +196,15 @@ describe('StreamLoader live streams are unaffected by the look-ahead', () => {
     // Live uses the legacy direct-feed loop: it starts at the live edge and never
     // pre-downloads a 15s cushion from the start of the playlist.
     expect(tracker.fetched.length).toBeGreaterThan(0);
-    expect(tracker.fetched.every((i) => i >= SEG_COUNT - 3)).toBe(true);
+    expect(tracker.fetched.every((i) => i >= SEG_COUNT - 2)).toBe(true);
 
     // No raw look-ahead cushion: live only pulls what it feeds at the edge
-    // (3 segments behind the live edge), NOT ~8 segments (15s / 2s) like VOD.
-    expect(tracker.fetched.length).toBeLessThanOrEqual(3);
+    // (2 segments behind the live edge), NOT ~8 segments (15s / 2s) like VOD.
+    expect(tracker.fetched.length).toBeLessThanOrEqual(2);
 
     // getBufferedEnd tracks the fed cursor for live (no download-ahead window):
     // it never leads the fed media position by the RAW_LOOKAHEAD margin.
-    const fedMediaEnd = fed.length * SEG_DURATION + (SEG_COUNT - 3) * SEG_DURATION;
+    const fedMediaEnd = fed.length * SEG_DURATION + (SEG_COUNT - 2) * SEG_DURATION;
     expect(loader.getBufferedEnd()).toBeLessThanOrEqual(fedMediaEnd);
 
     loader.destroy();
@@ -241,6 +242,72 @@ describe('StreamLoader live streams are unaffected by the look-ahead', () => {
     expect((loader as any).mediaBaseOf(SEG_COUNT)).toBe(SEG_COUNT * SEG_DURATION);
 
     loader.destroy();
+  });
+
+  it('throttles HLS live 404-resync rate using a sliding budget and exponential backoff', async () => {
+    vi.useFakeTimers();
+    
+    let playlistFetchCount = 0;
+    let segmentFetchCount = 0;
+    
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('.m3u8')) {
+        playlistFetchCount++;
+        return { ok: true, text: async () => makePlaylist(true) } as unknown as Response;
+      }
+      segmentFetchCount++;
+      return {
+        ok: false,
+        status: 404,
+        statusText: 'Not Found',
+      } as unknown as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const loader = makeLoader(() => {});
+    await loader.loadPlaylist('https://example.com/live/stream.m3u8');
+    
+    playlistFetchCount = 0;
+    segmentFetchCount = 0;
+
+    loader.start(() => false);
+
+    // Advance time to run several loops.
+    // In degraded mode, the resync budget allows max 3 resyncs (playlist fetches).
+    for (let i = 0; i < 10; i++) {
+      await vi.advanceTimersByTimeAsync(30);
+    }
+
+    expect(playlistFetchCount).toBe(3);
+    
+    const playlistFetchCountBefore = playlistFetchCount;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(playlistFetchCount).toBe(playlistFetchCountBefore);
+
+    // Success recovery
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.endsWith('.m3u8')) {
+        // Return grown playlist (35 segments) so currentSegmentIndex (30) is in bounds
+        const lines = ['#EXTM3U', '#EXT-X-VERSION:3', `#EXT-X-TARGETDURATION:${SEG_DURATION}`];
+        for (let i = 0; i < 35; i++) {
+          lines.push(`#EXTINF:${SEG_DURATION.toFixed(1)},`);
+          lines.push(`segment_${i}.ts`);
+        }
+        return { ok: true, text: async () => lines.join('\n') } as unknown as Response;
+      }
+      return {
+        ok: true,
+        arrayBuffer: async () => makeTsSegment(),
+      } as unknown as Response;
+    });
+
+    await vi.advanceTimersByTimeAsync(5000);
+    
+    expect((loader as any).isDegradedMode).toBe(false);
+    expect((loader as any).resyncBackoffAttempts).toBe(0);
+
+    loader.destroy();
+    vi.useRealTimers();
   });
 });
 
@@ -524,7 +591,6 @@ describe('StreamLoader archive VOD (PROGRAM-DATE-TIME)', () => {
     let metaCount = 0;
     const loader = makeArchiveLoader(() => {}, () => { metaCount++; });
     await loader.loadPlaylist('https://example.com/vod/stream.m3u8');
-
     expect(loader.hasProgramDateTime()).toBe(false);
     expect(loader.mediaToWall(5)).toBeNull();
     expect(loader.wallToMedia(Date.now())).toBeNull();
@@ -534,6 +600,193 @@ describe('StreamLoader archive VOD (PROGRAM-DATE-TIME)', () => {
     await waitFor(() => loader.getBufferedEnd() > 0);
     await new Promise((r) => setTimeout(r, 50));
     expect(metaCount).toBe(0); // plain VOD never emits segment meta
+
+    loader.destroy();
+  });
+
+  it('parses master playlist with multiple variants and populates QualityLevels', async () => {
+    const masterPlaylist = `
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42e00a,mp4a.40.2"
+low/stream.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2"
+high/stream.m3u8
+    `.trim();
+
+    const mediaPlaylist = `
+#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXTINF:6.0,
+segment_0.ts
+#EXT-X-ENDLIST
+    `.trim();
+
+    const fetches: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url: any) => {
+      fetches.push(url);
+      if (url === 'https://example.com/stream.m3u8') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve(masterPlaylist)
+        } as any);
+      }
+      if (url === 'https://example.com/low/stream.m3u8') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve(mediaPlaylist)
+        } as any);
+      }
+      return Promise.reject(new Error(`Unexpected fetch URL: ${url}`));
+    });
+
+    const loader = makeLoader(() => {});
+    await loader.load('https://example.com/stream.m3u8');
+
+    expect(fetches).toContain('https://example.com/stream.m3u8');
+    expect(fetches).toContain('https://example.com/low/stream.m3u8');
+
+    const levels = loader.getLevels();
+    expect(levels.length).toBe(2);
+
+    expect(levels[0].label).toBe('720p');
+    expect(levels[0].kind).toBe('main');
+    expect(levels[0].url).toBe('https://example.com/high/stream.m3u8');
+
+    expect(levels[1].label).toBe('360p');
+    expect(levels[1].kind).toBe('sub');
+    expect(levels[1].url).toBe('https://example.com/low/stream.m3u8');
+
+    expect(loader.getActiveId()).toBe('https://example.com/low/stream.m3u8');
+
+    loader.destroy();
+    vi.restoreAllMocks();
+  });
+
+  it('switches quality levels and reloads media playlist accordingly', async () => {
+    const masterPlaylist = `
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+low/stream.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+high/stream.m3u8
+    `.trim();
+
+    const mediaHigh = `
+#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXTINF:6.0,
+high_0.ts
+#EXTINF:6.0,
+high_1.ts
+#EXT-X-ENDLIST
+    `.trim();
+
+    const mediaLow = `
+#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXTINF:6.0,
+low_0.ts
+#EXTINF:6.0,
+low_1.ts
+#EXT-X-ENDLIST
+    `.trim();
+
+    const fetches: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url: any) => {
+      fetches.push(url);
+      if (url === 'https://example.com/stream.m3u8') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve(masterPlaylist)
+        } as any);
+      }
+      if (url === 'https://example.com/high/stream.m3u8') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve(mediaHigh)
+        } as any);
+      }
+      if (url === 'https://example.com/low/stream.m3u8') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve(mediaLow)
+        } as any);
+      }
+      return Promise.reject(new Error(`Unexpected fetch URL: ${url}`));
+    });
+
+    const loader = makeLoader(() => {});
+    await loader.load('https://example.com/stream.m3u8');
+
+    expect(loader.getActiveId()).toBe('https://example.com/low/stream.m3u8');
+    
+    fetches.length = 0;
+    await loader.quality!.switchQuality('https://example.com/high/stream.m3u8');
+
+    expect(loader.getActiveId()).toBe('https://example.com/high/stream.m3u8');
+    expect(fetches).toContain('https://example.com/high/stream.m3u8');
+
+    loader.destroy();
+    vi.restoreAllMocks();
+  });
+});
+
+describe('StreamLoader EWMA throughput', () => {
+  it('initializes throughput with the first sample', () => {
+    const loader = makeLoader(() => {});
+    // Access private method via cast
+    const sl = loader as any;
+    expect(sl.getThroughput().throughputKbps).toBe(0);
+    expect(sl.getThroughput().throughputSamples).toBe(0);
+
+    // 1MB in 100ms → (1_000_000 * 8) / 100 = 80000 Kbps
+    sl.recordThroughputSample(1_000_000, 100);
+    const tp = sl.getThroughput();
+    expect(tp.throughputSamples).toBe(1);
+    expect(tp.throughputKbps).toBeGreaterThan(70000);
+
+    loader.destroy();
+  });
+
+  it('applies EWMA smoothing on subsequent samples', () => {
+    const loader = makeLoader(() => {});
+    const sl = loader as any;
+
+    // First sample: 100KB in 100ms → (100000 * 8) / 100 = 8000 Kbps
+    sl.recordThroughputSample(100000, 100);
+    const first = sl.smoothedThroughputKbps;
+
+    // Second sample: much lower: 10KB in 100ms → ≈ 781.25 Kbps
+    sl.recordThroughputSample(10000, 100);
+    const second = sl.smoothedThroughputKbps;
+
+    // EWMA should dampen the drop — second should be between first and 781
+    expect(second).toBeLessThan(first);
+    expect(second).toBeGreaterThan(781);
+
+    // Third sample: same low value → should decrease further
+    sl.recordThroughputSample(10000, 100);
+    const third = sl.smoothedThroughputKbps;
+    expect(third).toBeLessThan(second);
+
+    expect(sl.getThroughput().throughputSamples).toBe(3);
+    loader.destroy();
+  });
+
+  it('clamps zero-duration to 1ms minimum', () => {
+    const loader = makeLoader(() => {});
+    const sl = loader as any;
+
+    // Zero duration should not throw or produce Infinity
+    sl.recordThroughputSample(1000, 0);
+    const tp = sl.getThroughput();
+    expect(Number.isFinite(tp.throughputKbps)).toBe(true);
+    expect(tp.throughputKbps).toBeGreaterThan(0);
 
     loader.destroy();
   });

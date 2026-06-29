@@ -1,6 +1,7 @@
 import { Logger } from '../utils/Logger.js';
 import { MockStreamGenerator } from './MockStreamGenerator.js';
 import { IStreamLoader, LoaderDeps, LoaderKind, SegmentMeta, WallClockRange } from './IStreamLoader.js';
+import { QualityLevel, QualitySource } from '../quality/QualitySource.js';
 
 export interface Segment {
   url: string;
@@ -12,9 +13,13 @@ export interface Segment {
   discontinuity?: boolean;
 }
 
-export class StreamLoader implements IStreamLoader {
+export class StreamLoader implements IStreamLoader, QualitySource {
   /** HLS is pull-driven: the player fetches segments on demand and may seek. */
   public readonly kind: LoaderKind = 'pull';
+  public readonly quality: QualitySource = this;
+
+  private qualityLevels: QualityLevel[] = [];
+  private activeQualityId = '';
 
   private segments: Segment[] = [];
   private segmentUrls: Set<string> = new Set();
@@ -38,6 +43,9 @@ export class StreamLoader implements IStreamLoader {
    */
   private pendingRaw: { index: number; buffer: ArrayBuffer; duration: number }[] = [];
   private consecutiveFailures = 0;
+  private resyncTimestamps: number[] = [];
+  private resyncBackoffAttempts = 0;
+  private isDegradedMode = false;
   private isBackpressurePausedFn: (() => boolean) | null = null;
   /**
    * How many seconds of raw (un-decoded) segment data to pre-download ahead of the
@@ -64,6 +72,10 @@ export class StreamLoader implements IStreamLoader {
   private activeAbortController: AbortController | null = null;
   private loopTimeoutId: ReturnType<typeof setTimeout> | null = null;
   private loopGeneration = 0;
+
+  private smoothedThroughputKbps = 0;
+  private throughputSamplesCount = 0;
+  private alpha = 0.15;
 
   private getAbortSignal(): AbortSignal {
     if (!this.activeAbortController) {
@@ -150,6 +162,8 @@ export class StreamLoader implements IStreamLoader {
 
   // ─── IStreamLoader ──────────────────────────────────────────────────
   public load(url: string): Promise<void> {
+    this.qualityLevels = [];
+    this.activeQualityId = '';
     return this.loadPlaylist(url);
   }
 
@@ -212,10 +226,41 @@ export class StreamLoader implements IStreamLoader {
         const lines = text.split('\n');
         const urlWithoutHash = url.split('#')[0].split('?')[0];
         const baseUrl = urlWithoutHash.substring(0, urlWithoutHash.lastIndexOf('/') + 1);
-        let streamUrl = '';
+        
+        const parsedLevels: QualityLevel[] = [];
+        
         for (let i = 0; i < lines.length; i++) {
           const line = lines[i].trim();
           if (line.startsWith('#EXT-X-STREAM-INF')) {
+            const attrStr = line.substring('#EXT-X-STREAM-INF'.length);
+            
+            let bandwidth: number | undefined;
+            let width: number | undefined;
+            let height: number | undefined;
+            let codecs: string | undefined;
+            
+            const bandwidthMatch = /BANDWIDTH=(\d+)/.exec(attrStr);
+            if (bandwidthMatch) {
+              bandwidth = parseInt(bandwidthMatch[1], 10);
+            }
+            
+            const resolutionMatch = /RESOLUTION=(\d+)x(\d+)/.exec(attrStr);
+            if (resolutionMatch) {
+              width = parseInt(resolutionMatch[1], 10);
+              height = parseInt(resolutionMatch[2], 10);
+            }
+            
+            const codecsMatch = /CODECS="([^"]+)"/.exec(attrStr);
+            if (codecsMatch) {
+              codecs = codecsMatch[1];
+            } else {
+              const codecsNoQuotesMatch = /CODECS=([^,]+)/.exec(attrStr);
+              if (codecsNoQuotesMatch) {
+                codecs = codecsNoQuotesMatch[1];
+              }
+            }
+            
+            let streamUrl = '';
             for (let j = i + 1; j < lines.length; j++) {
               const nextLine = lines[j].trim();
               if (nextLine && !nextLine.startsWith('#')) {
@@ -223,17 +268,67 @@ export class StreamLoader implements IStreamLoader {
                 break;
               }
             }
-            if (streamUrl) break;
+            
+            if (streamUrl) {
+              const resolvedUrl = streamUrl.startsWith('http') ? streamUrl : baseUrl + streamUrl;
+              parsedLevels.push({
+                id: resolvedUrl,
+                label: height ? `${height}p` : `${(bandwidth ? Math.round(bandwidth / 1000) : 0)}kbps`,
+                url: resolvedUrl,
+                kind: height ? (height <= 480 ? 'sub' : 'main') : 'main',
+                width,
+                height,
+                bitrateKbps: bandwidth ? Math.round(bandwidth / 1000) : undefined,
+                codecs
+              });
+            }
           }
         }
-        if (streamUrl) {
-          const resolvedUrl = streamUrl.startsWith('http') ? streamUrl : baseUrl + streamUrl;
-          this.logger.debug(`Master playlist detected. Loading media playlist: ${resolvedUrl}`);
-          return this.loadPlaylist(resolvedUrl);
+        
+        if (parsedLevels.length > 0) {
+          const firstVariantId = parsedLevels[0].id;
+          parsedLevels.sort((a, b) => (b.bitrateKbps || 0) - (a.bitrateKbps || 0));
+          
+          let hasSub = false;
+          let hasMain = false;
+          for (const lvl of parsedLevels) {
+            if (lvl.height) {
+              lvl.kind = lvl.height <= 480 ? 'sub' : 'main';
+            } else {
+              lvl.kind = (lvl.bitrateKbps || 0) <= 800 ? 'sub' : 'main';
+            }
+            if (lvl.kind === 'sub') hasSub = true;
+            if (lvl.kind === 'main') hasMain = true;
+          }
+          if (!hasSub) {
+            parsedLevels[parsedLevels.length - 1].kind = 'sub';
+          }
+          if (!hasMain) {
+            parsedLevels[0].kind = 'main';
+          }
+          
+          this.qualityLevels = parsedLevels;
+          
+          if (!this.activeQualityId || !this.qualityLevels.some(l => l.id === this.activeQualityId)) {
+            this.activeQualityId = firstVariantId;
+          }
+          
+          const activeLevel = this.qualityLevels.find(l => l.id === this.activeQualityId)!;
+          this.logger.debug(`Master playlist detected. Loading active quality: ${activeLevel.label} (${activeLevel.url})`);
+          return this.loadPlaylist(activeLevel.url);
         }
         throw new Error('No media playlist found in master playlist.');
       }
 
+      if (this.qualityLevels.length === 0) {
+        this.qualityLevels = [{
+          id: url,
+          label: 'Auto',
+          url,
+          kind: 'main'
+        }];
+        this.activeQualityId = url;
+      }
       this.parseM3U8(text, url);
 
       // Download init segment if present
@@ -316,9 +411,9 @@ export class StreamLoader implements IStreamLoader {
       // Fresh segments array — invalidate the prefix-sum cache.
       this.markSegmentsDirty();
 
-      // If it is a live stream, seek to the active edge (third to last segment) on first load
+      // If it is a live stream, seek to the active edge (second to last segment) on first load
       if (this.isLive && this.segments.length > 0) {
-        this.currentSegmentIndex = Math.max(0, this.segments.length - 3);
+        this.currentSegmentIndex = Math.max(0, this.segments.length - 2);
         this.logger.debug(`Live stream detected. Starting playback from active edge segment index: ${this.currentSegmentIndex}`);
       }
     } else {
@@ -500,6 +595,7 @@ export class StreamLoader implements IStreamLoader {
     if (canFetch) {
       const segment = this.segments[this.fetchIndex];
       try {
+        const startTime = performance.now();
         const res = await fetch(segment.url, { signal: this.getAbortSignal() });
         if (this.loopGeneration !== gen) return; // seek/stop happened while fetching
 
@@ -507,6 +603,9 @@ export class StreamLoader implements IStreamLoader {
         let isValid = false;
         if (res.ok) {
           buffer = await res.arrayBuffer();
+          const endTime = performance.now();
+          this.recordThroughputSample(buffer.byteLength, endTime - startTime);
+          
           const uint8 = new Uint8Array(buffer);
           if (this.isValidSegment(uint8)) {
             isValid = true;
@@ -573,10 +672,10 @@ export class StreamLoader implements IStreamLoader {
     }
 
     if (this.isLive && this.segments.length > 0) {
-      const maxBehind = 4;
+      const maxBehind = 3;
       const liveEdgeIndex = Math.max(0, this.segments.length - 1);
       if (liveEdgeIndex - this.currentSegmentIndex > maxBehind) {
-        const safeTargetIndex = Math.max(0, this.segments.length - 3);
+        const safeTargetIndex = Math.max(0, this.segments.length - 2);
         this.logger.warn(`Live streaming lag detected (currently at ${this.currentSegmentIndex}, latest is ${this.segments.length - 1}). Fast-forwarding to safe buffer index: ${safeTargetIndex}`);
         this.currentSegmentIndex = safeTargetIndex;
       }
@@ -591,8 +690,10 @@ export class StreamLoader implements IStreamLoader {
         await this.refreshPlaylist();
 
         if (this.currentSegmentIndex >= this.segments.length) {
-          // No new segments are available yet. Poll at half target duration (spec compliant, saves CPU/network)
-          const retryDelay = Math.max(500, Math.min(2500, (this.targetDuration * 1000) / 2));
+          // No new segments are available yet. Poll frequently to minimise
+          // frame starvation — 200ms floor keeps bandwidth low while ensuring
+          // the next segment is picked up promptly.
+          const retryDelay = Math.max(200, Math.min(1500, (this.targetDuration * 1000) / 3));
           scheduleNext(retryDelay);
           return;
         }
@@ -614,12 +715,16 @@ export class StreamLoader implements IStreamLoader {
       scheduleNext(activeSegment.duration * 1000);
     } else {
       try {
+        const startTime = performance.now();
         const res = await fetch(activeSegment.url, { signal: this.getAbortSignal() });
         let isValid = false;
         let buffer: ArrayBuffer | null = null;
 
         if (res.ok) {
           buffer = await res.arrayBuffer();
+          const endTime = performance.now();
+          this.recordThroughputSample(buffer.byteLength, endTime - startTime);
+          
           const uint8 = new Uint8Array(buffer);
           if (this.isValidSegment(uint8)) {
             isValid = true;
@@ -638,6 +743,15 @@ export class StreamLoader implements IStreamLoader {
           this.onSegmentLoaded?.(buffer);
           this.currentSegmentIndex++;
           this.consecutiveFailures = 0;
+
+          // Reset resync budget states on successful segment load
+          this.resyncBackoffAttempts = 0;
+          this.resyncTimestamps = [];
+          if (this.isDegradedMode) {
+            this.isDegradedMode = false;
+            this.logger.debug('Exited degraded mode (successful segment download)');
+          }
+
           // Small delay to let decoder process the segment before flooding with the next
           scheduleNext(50);
         } else {
@@ -652,12 +766,32 @@ export class StreamLoader implements IStreamLoader {
 
             if (this.consecutiveFailures >= 2) {
               // Multiple consecutive 404s — we've fallen behind the live window.
+              // Check resync budget (max 3 resyncs per 10 seconds)
+              const now = Date.now();
+              this.resyncTimestamps = this.resyncTimestamps.filter(t => now - t < 10000);
+
+              if (this.resyncTimestamps.length >= 3) {
+                this.resyncBackoffAttempts++;
+                const baseBackoff = Math.min(5000, 500 * Math.pow(2, this.resyncBackoffAttempts - 1));
+                const jitter = baseBackoff * 0.2 * (Math.random() * 2 - 1);
+                const backoff = baseBackoff + jitter;
+
+                if (!this.isDegradedMode) {
+                  this.isDegradedMode = true;
+                  this.logger.debug('Entered degraded mode (resync budget exhausted)');
+                }
+                this.logger.warn(`Resync budget (3 resyncs per 10s) exhausted. Entering backoff for ${Math.round(backoff)}ms.`);
+                scheduleNext(backoff);
+                return;
+              }
+
               // Refresh playlist and jump to the live edge.
+              this.resyncTimestamps.push(now);
               this.logger.warn(`Too many 404s in sequence (${this.consecutiveFailures}). Resyncing to live edge...`);
               await this.refreshPlaylist();
               // Jump to the latest available segment (safe buffer edge)
               if (this.segments.length > 0) {
-                this.currentSegmentIndex = Math.max(0, this.segments.length - 3);
+                this.currentSegmentIndex = Math.max(0, this.segments.length - 2);
                 this.logger.debug(`Resynced to safe buffer edge at segment index: ${this.currentSegmentIndex}`);
               }
               this.consecutiveFailures = 0;
@@ -745,7 +879,8 @@ export class StreamLoader implements IStreamLoader {
 
   public getDuration(): number {
     if (this.isLive) return Infinity;
-    return this.segments.reduce((sum, seg) => sum + seg.duration, 0);
+    const starts = this.ensureSegmentStarts();
+    return starts[this.segments.length];
   }
 
   // ─── Wall-clock (PROGRAM-DATE-TIME) timeline ────────────────────────
@@ -896,11 +1031,80 @@ export class StreamLoader implements IStreamLoader {
     const downloadedThrough = this.isRawLookaheadEligible()
       ? this.fetchIndex
       : this.currentSegmentIndex;
-    let end = 0;
-    for (let i = 0; i < downloadedThrough && i < this.segments.length; i++) {
-      end += this.segments[i].duration;
+    const starts = this.ensureSegmentStarts();
+    const limit = Math.min(downloadedThrough, this.segments.length);
+    return starts[limit];
+  }
+
+  public getThroughput(): { throughputKbps: number; throughputSamples: number } {
+    return {
+      throughputKbps: Math.round(this.smoothedThroughputKbps),
+      throughputSamples: this.throughputSamplesCount,
+    };
+  }
+
+  private recordThroughputSample(bytes: number, durationMs: number): void {
+    if (durationMs <= 0) durationMs = 1;
+    const sampleKbps = (bytes * 8) / durationMs;
+    if (this.smoothedThroughputKbps === 0) {
+      this.smoothedThroughputKbps = sampleKbps;
+    } else {
+      this.smoothedThroughputKbps = this.alpha * sampleKbps + (1 - this.alpha) * this.smoothedThroughputKbps;
     }
-    return end;
+    this.throughputSamplesCount++;
+  }
+
+  // ─── QualitySource implementation ───────────────────────────────────
+  public getLevels(): QualityLevel[] {
+    return this.qualityLevels;
+  }
+
+  public getActiveId(): string {
+    return this.activeQualityId;
+  }
+
+  public async switchQuality(id: string): Promise<void> {
+    const level = this.qualityLevels.find(l => l.id === id);
+    if (!level) {
+      this.logger.warn(`Quality level not found: ${id}`);
+      return;
+    }
+    if (this.activeQualityId === id) {
+      return; // Already active
+    }
+
+    this.logger.info(`Switching quality to: ${level.label} (${level.url})`);
+    
+    // Save current playback position
+    const currentTime = this.isLive ? 0 : this.getCurrentTimeEstimate();
+    
+    this.activeQualityId = id;
+    this.playlistUrl = level.url;
+    
+    // Stop the current downloads & clear queue
+    const wasDownloading = this.isDownloading;
+    this.stopDownloading();
+    
+    // Reload the playlist
+    await this.loadPlaylist(level.url);
+    
+    // Restore position if VOD
+    if (!this.isLive) {
+      this.seek(currentTime);
+    }
+    
+    // Resume downloading if it was active
+    if (wasDownloading && this.isBackpressurePausedFn) {
+      this.startDownloading(this.isBackpressurePausedFn);
+    }
+  }
+
+  private getCurrentTimeEstimate(): number {
+    let time = 0;
+    for (let i = 0; i < this.currentSegmentIndex && i < this.segments.length; i++) {
+      time += this.segments[i].duration;
+    }
+    return time;
   }
 
   public destroy() {
@@ -914,6 +1118,9 @@ export class StreamLoader implements IStreamLoader {
     this.onMockPacket = null;
     this.onError = null;
     this.initSegmentBuffer = null;
+    this.resyncTimestamps = [];
+    this.resyncBackoffAttempts = 0;
+    this.isDegradedMode = false;
   }
 
   private isValidSegment(uint8: Uint8Array): boolean {
@@ -943,7 +1150,9 @@ export class StreamLoader implements IStreamLoader {
       
       const readChunk = async () => {
         if (!this.isDownloading || this.loopGeneration !== gen) {
-          reader.cancel().catch(() => {});
+          reader.cancel().catch((err) => {
+            this.logger.debug('Failed to cancel stream reader:', err);
+          });
           return;
         }
 

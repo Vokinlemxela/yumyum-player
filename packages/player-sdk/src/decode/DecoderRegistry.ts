@@ -230,7 +230,9 @@ export abstract class BaseVideoDecoder implements IBaseDecoder {
   public flush() {
     this.hasDecodedFirstKeyframe = false;
     if (this.decoder && this.decoder.state === 'configured') {
-      this.decoder.flush().catch(() => {});
+      this.decoder.flush().catch((err) => {
+        this.logger.debug('Failed to flush video decoder:', err);
+      });
     }
   }
 
@@ -297,7 +299,9 @@ export class H264Decoder extends BaseVideoDecoder {
     if (this.decoder) {
       try {
         this.decoder.close();
-      } catch (e) {}
+      } catch (e) {
+        this.logger.debug('Failed to close video decoder during H264 recovery:', e);
+      }
       this.decoder = null;
     }
 
@@ -496,7 +500,9 @@ export class HEVCDecoder extends BaseVideoDecoder {
     if (this.decoder) {
       try {
         this.decoder.close();
-      } catch (e) {}
+      } catch (e) {
+        this.logger.debug('Failed to close video decoder during HEVC recovery:', e);
+      }
       this.decoder = null;
     }
 
@@ -800,7 +806,11 @@ export class AACDecoder implements IBaseDecoder {
 
   private createDecoder(config: AudioDecoderConfig, sampleRate: number, channels: number, profile: number) {
     if (this.decoder) {
-      try { this.decoder.close(); } catch (e) {}
+      try {
+        this.decoder.close();
+      } catch (e) {
+        this.logger.debug('Failed to close audio decoder:', e);
+      }
     }
 
     this.decoder = new AudioDecoder({
@@ -1005,7 +1015,9 @@ export class AACDecoder implements IBaseDecoder {
   public flush() {
     this.pendingPackets = [];
     if (this.decoder && this.decoder.state === 'configured') {
-      this.decoder.flush().catch(() => {});
+      this.decoder.flush().catch((err) => {
+        this.logger.debug('Failed to flush audio decoder:', err);
+      });
     }
   }
 

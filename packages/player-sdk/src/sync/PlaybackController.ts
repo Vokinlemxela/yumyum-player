@@ -1,4 +1,7 @@
 import { Logger } from '../utils/Logger.js';
+import { AudioMasterClock } from '../render/AudioMasterClock.js';
+import { TimingPolicy } from './TimingPolicy.js';
+import { StreamSignals } from '../quality/Signals.js';
 
 export interface DecodedFrame {
   pts: number; // in seconds
@@ -36,16 +39,16 @@ export class PlaybackController {
   private mediaStartClock = 0; // The media position when playback started
   private audioCtxStartOffset: number | null = null; // AudioContext time at start/seek
   private playbackRate = 1; // Playback speed multiplier (1 = normal)
-  // A/V master-clock fallback state. The audio clock is the master, but it can
-  // briefly vanish (underrun) or jump (re-anchor after a seek). `audioAcquired`
-  // tracks whether we've locked onto it: the first lock adopts it outright, then
-  // we follow it only while it stays near the (audio-slaved) system clock, so the
-  // video scheduler never sees a multi-second jump.
-  private audioAcquired = false;
-  private lastAudioClock = 0;            // last accepted audio-clock value (s)
-  private lastAudioWall = 0;             // performance.now()/1000 at that moment
-  /** How long to hold the last audio position on an underrun before freewheeling. */
-  private static readonly UNDERRUN_HOLD = 1.0;
+  private lastCorrectionTime = 0; // Last wall-clock time (s) of live clock correction
+
+  // Unified A/V master clock slaved to the audio clock
+  private masterClock = new AudioMasterClock({
+    resyncThreshold: TimingPolicy.CLOCK_RESYNC_THRESHOLD,
+    driftNudge: 1.0, // Hard snap on acceptance
+    adoptTolerance: TimingPolicy.AUDIO_ADOPT_TOLERANCE,
+    seekResyncTolerance: TimingPolicy.SEEK_RESYNC_TOLERANCE,
+    underrunHold: TimingPolicy.UNDERRUN_HOLD
+  });
 
   // Backpressure thresholds for the DECODED-frame queue. Kept small on purpose:
   // the queue holds decoded VideoFrames, and holding many of them back-pressures
@@ -68,6 +71,9 @@ export class PlaybackController {
   private lastKeptPts = -1;
   private decodedFramesCount = 0;
   private renderedFrameTimes: number[] = [];
+  private droppedFrameTimes: number[] = [];
+  private queueLengthSamples: number[] = [];
+  private signalsInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private getAudioClock: (() => number | null) | null, // returns audioCtx.currentTime adjusted for latency
@@ -78,7 +84,8 @@ export class PlaybackController {
     private targetFps: number | undefined,
     private renderFps: number | undefined,
     private lowPower: boolean | undefined,
-    private logger: Logger
+    private logger: Logger,
+    private onSignals?: ((signals: StreamSignals) => void) | null,
   ) {
     if (this.lowPower) {
       if (this.targetFps === undefined) this.targetFps = 8;
@@ -88,6 +95,8 @@ export class PlaybackController {
     } else if (this.targetFps !== undefined) {
       if (this.renderFps === undefined) this.renderFps = this.targetFps;
     }
+    this.masterClock.setAnchor(0, performance.now() / 1000);
+    this.startSignalsInterval();
   }
 
   public get hasStarted(): boolean {
@@ -97,6 +106,17 @@ export class PlaybackController {
   /** True while playback is stalled (buffering) during PLAYING. */
   public get isBuffering(): boolean {
     return this.buffering;
+  }
+
+  public setLowPower(lowPower: boolean): void {
+    this.lowPower = lowPower;
+    if (lowPower) {
+      this.targetFps = 8;
+      this.renderFps = 8;
+      this.maxQueueSize = 5;
+      this.minQueueSize = 2;
+      this.logger.info('PlaybackController: Switched to lowPower mode (FPS target: 8)');
+    }
   }
 
   /**
@@ -130,6 +150,7 @@ export class PlaybackController {
           }
         }
         this.droppedFramesCount++;
+        this.droppedFrameTimes.push(performance.now());
         return;
       }
       this.lastKeptPts = Math.max(this.lastKeptPts, frame.pts);
@@ -158,6 +179,8 @@ export class PlaybackController {
     const audioTime = this.getAudioClock ? this.getAudioClock() : null;
     this.audioCtxStartOffset = audioTime;
 
+    this.masterClock.setAnchor(this.mediaStartClock, this.playStartTime);
+
     this.scheduleTick();
   }
 
@@ -176,13 +199,14 @@ export class PlaybackController {
     this.audioCtxStartOffset = null;
     // Leaving PLAYING — clear any buffering signal so the spinner doesn't stick.
     this.setBuffering(false);
+
+    this.masterClock.setAnchor(this.mediaStartClock, performance.now() / 1000);
   }
 
   public seek(pts: number) {
-    // flush() resets audioAcquired, so the system clock (anchored at the seek
+    // flush() resets masterClock, so the system clock (anchored at the seek
     // target below) drives playback until the flushed audio pipeline re-anchors
-    // at the new position and is re-adopted — it can't race ahead of the
-    // not-yet-decoded video and drop every incoming frame.
+    // at the new position and is re-adopted.
     this.flush();
     this.mediaStartClock = pts;
     this.playStartTime = performance.now() / 1000;
@@ -190,6 +214,8 @@ export class PlaybackController {
 
     const audioTime = this.getAudioClock ? this.getAudioClock() : null;
     this.audioCtxStartOffset = audioTime;
+
+    this.masterClock.setAnchor(pts, this.playStartTime);
   }
 
   public flush() {
@@ -214,8 +240,7 @@ export class PlaybackController {
     this.setBuffering(false);
     // The audio pipeline is also flushed on seek/codec-change: re-acquire its
     // clock from scratch (the first valid sample after the flush is adopted).
-    this.audioAcquired = false;
-    this.lastAudioWall = 0;
+    this.masterClock.reset();
     this.onBackpressureChange?.(false);
   }
 
@@ -254,81 +279,27 @@ export class PlaybackController {
     this.playStartTime = performance.now() / 1000;
     this.audioCtxStartOffset = null;
     this.playbackRate = rate;
+    this.masterClock.setAnchor(this.mediaStartClock, this.playStartTime);
   }
-
-  /** Max gap (s) for following the audio clock once locked — tight, to reject spikes. */
-  private static readonly SEEK_RESYNC_TOLERANCE = 0.5;
-  /**
-   * Max gap (s) for the FIRST adoption of the audio clock (startup / post-flush).
-   * Generous enough to absorb audio output+buffer latency (the audio heard now is
-   * ~1s behind the video-anchored placeholder clock) while still rejecting a
-   * wildly stale value such as the pre-seek position.
-   */
-  private static readonly AUDIO_ADOPT_TOLERANCE = 2.0;
 
   public getCurrentTime(): number {
-    // At non-1x speed the audio clock is not stretched, so it no longer
-    // reflects the (scaled) media position — always use the system clock.
-    if (this.playbackRate === 1) {
-      const audioTime = this.getAudioClock ? this.getAudioClock() : null;
-
-      if (audioTime !== null && audioTime >= 0) {
-        const systemTime = this.getSystemClockTime();
-        // Audio is the A/V master. On the FIRST acquisition (startup, or after a
-        // flush/seek) adopt it unconditionally and re-anchor the system clock to
-        // it — the audio clock reflects what is actually heard, and the system
-        // clock was only a video-anchored placeholder that sits ~1 buffer ahead.
-        // After that, follow audio only while it stays near the (audio-slaved)
-        // system clock: normal progression always passes, but a spike (bad PTS
-        // marker / underrun overshoot) or stale value is rejected so the video
-        // scheduler never sees a multi-second jump.
-        const gap = Math.abs(audioTime - systemTime);
-        // First lock: adopt within a generous window that absorbs the audio
-        // output/buffer latency (~1s) but still rejects a wildly stale value (e.g.
-        // the old position racing in before a post-seek flush settles). Once
-        // locked: a tight window rejects spikes.
-        const accept = this.audioAcquired
-          ? gap <= PlaybackController.SEEK_RESYNC_TOLERANCE
-          : gap <= PlaybackController.AUDIO_ADOPT_TOLERANCE;
-        if (accept) {
-          this.audioAcquired = true;
-          // Slave the system (fallback) clock to audio so a future underrun
-          // freewheels seamlessly from here instead of snapping to a diverged clock.
-          this.mediaStartClock = audioTime;
-          this.playStartTime = performance.now() / 1000;
-          this.lastAudioClock = audioTime;
-          this.lastAudioWall = this.playStartTime;
-          return audioTime;
-        }
-        // Diverged spike: freewheel on the (last-slaved) system clock, no re-anchor.
-        return systemTime;
-      }
-
-      // Audio clock unavailable. Distinguish a brief underrun (audio was just
-      // playing) from a genuinely audio-less stream.
-      if (this.audioAcquired) {
-        const now = performance.now() / 1000;
-        if (now - this.lastAudioWall < PlaybackController.UNDERRUN_HOLD) {
-          // Brief underrun: hold the last audio position so video freezes in place
-          // (honest micro-rebuffer) and stays in A/V sync, rather than racing the
-          // realtime system clock and then jumping back when audio returns.
-          return this.lastAudioClock;
-        }
-        // Audio has been gone too long — give up on it and let the system clock
-        // freewheel so playback continues (re-anchored at the held position). The
-        // next valid audio sample re-adopts (one-time correction) to regain sync.
-        this.audioAcquired = false;
-        this.mediaStartClock = this.lastAudioClock;
-        this.playStartTime = performance.now() / 1000;
-      }
+    if (this.state !== 'PLAYING') {
+      return this.masterClock.anchorPts;
     }
 
-    return this.getSystemClockTime();
+    const now = performance.now() / 1000;
+    if (this.playbackRate === 1) {
+      const audioTime = this.getAudioClock ? this.getAudioClock() : null;
+      this.masterClock.update(audioTime, now);
+      return this.masterClock.read(now) ?? this.getSystemClockTime(now);
+    }
+
+    return this.getSystemClockTime(now);
   }
 
-  public getSystemClockTime(): number {
+  public getSystemClockTime(now = performance.now() / 1000): number {
     if (this.state === 'PLAYING') {
-      const elapsed = (performance.now() / 1000) - this.playStartTime;
+      const elapsed = now - this.playStartTime;
       return this.mediaStartClock + elapsed * this.playbackRate;
     }
     return this.mediaStartClock;
@@ -352,8 +323,19 @@ export class PlaybackController {
 
   private tick() {
     if (this.state !== 'PLAYING') return;
+
+    // Prune old render times regularly to prevent memory leaks if telemetry isn't polled
+    const now = performance.now();
+    while (this.renderedFrameTimes.length > 0 && this.renderedFrameTimes[0] < now - 1000) {
+      this.renderedFrameTimes.shift();
+    }
+
     this.tickCount++;
+    this.queueLengthSamples.push(this.frameQueue.length);
     const isThrottle = this.tickCount % 60 === 1;
+
+    const tickInterval = this.renderFps ? (1.0 / this.renderFps) : 0.040;
+    const FRAME_LAG_THRESHOLD = Math.max(TimingPolicy.FRAME_LAG_FLOOR, tickInterval * TimingPolicy.FRAME_LAG_MULT);
 
     // Auto-pause at the end of the media VOD stream
     let currentClock = this.getCurrentTime();
@@ -367,8 +349,13 @@ export class PlaybackController {
     // Real-time synchronization & catch-up
     if (this.lastRenderedPTS !== -1 && this.frameQueue.length > 0) {
       // 1. Queue size catch-up (Live streams only)
-      if (this.duration === Infinity && this.frameQueue.length > 45) {
-        const dropCount = this.frameQueue.length - 5;
+      // Dynamic limits based on FPS to avoid conflicts with HLS segment buffers.
+      const fps = this.targetFps ?? 25;
+      const catchupThreshold = Math.max(150, fps * TimingPolicy.CATCHUP_THRESHOLD_MULT);
+      const catchupTarget = Math.max(60, Math.floor(fps * TimingPolicy.CATCHUP_TARGET_MULT));
+
+      if (this.duration === Infinity && this.frameQueue.length > catchupThreshold) {
+        const dropCount = this.frameQueue.length - catchupTarget;
         const droppedFrames = this.frameQueue.splice(0, dropCount);
         for (const dropped of droppedFrames) {
           if (dropped.data && 'close' in dropped.data) {
@@ -380,22 +367,45 @@ export class PlaybackController {
           }
         }
         this.droppedFramesCount += dropCount;
+        for (let d = 0; d < dropCount; d++) this.droppedFrameTimes.push(performance.now());
       }
 
-      // 2. Clock drift correction: keep the clock locked closely to the enqueued frame's PTS
+      // 2. Drift correction: keep the clock locked closely to the enqueued frame's PTS
       const firstFrame = this.frameQueue[0];
       const clockDiff = firstFrame.pts - currentClock;
       
-      // For live streams, correct both ways (if clock is ahead by >40ms or behind by >80ms).
-      // For VOD streams, only correct if the clock is ahead (drifted ahead) by >40ms (clockDiff < -0.040),
-      // to avoid dropping frames as late. Do not pull the clock forward if it is behind.
-      const shouldCorrect = this.duration === Infinity
-        ? (clockDiff < -0.040 || clockDiff > 0.080)
-        : (clockDiff < -0.040);
+      let shouldCorrect = false;
+      const nowWall = performance.now() / 1000;
+
+      if (this.duration === Infinity) {
+        // For live streams, correct forward if the oldest frame is in the future.
+        // Correct backward ONLY if the clock has run ahead of the entire queue (newest frame is late).
+        const lastFrame = this.frameQueue[this.frameQueue.length - 1];
+        const lastFrameDiff = lastFrame.pts - currentClock;
+
+        const exceedsForward = clockDiff > TimingPolicy.LIVE_FORWARD_DEADBAND;
+        const exceedsBackward = lastFrameDiff < -(FRAME_LAG_THRESHOLD + TimingPolicy.LIVE_BACKWARD_PADDING);
+
+        if (exceedsForward || exceedsBackward) {
+          const cooldownElapsed = nowWall - this.lastCorrectionTime;
+          // Bypass cooldown for large discontinuities (exceeding CLOCK_RESYNC_THRESHOLD = 150ms)
+          const isDiscontinuity = Math.abs(clockDiff) > TimingPolicy.CLOCK_RESYNC_THRESHOLD;
+          if (isDiscontinuity || cooldownElapsed >= TimingPolicy.CORRECTION_COOLDOWN) {
+            shouldCorrect = true;
+          }
+        }
+      } else {
+        // For VOD streams, only correct if the clock is ahead (drifted ahead) by >40ms (clockDiff < -0.040),
+        // to avoid dropping frames as late. Do not pull the clock forward if it is behind.
+        shouldCorrect = clockDiff < TimingPolicy.VOD_DRIFT_AHEAD_TRIGGER;
+      }
 
       if (shouldCorrect) {
+        this.logger.debug(`Correcting clock to firstFrame.pts: ${firstFrame.pts.toFixed(3)}s (clockDiff: ${clockDiff.toFixed(3)}s)`);
         this.mediaStartClock = firstFrame.pts;
-        this.playStartTime = performance.now() / 1000;
+        this.playStartTime = nowWall;
+        this.lastCorrectionTime = nowWall;
+        this.masterClock.setAnchor(firstFrame.pts, nowWall);
         
         const audioTime = this.getAudioClock ? this.getAudioClock() : null;
         this.audioCtxStartOffset = audioTime;
@@ -407,8 +417,7 @@ export class PlaybackController {
 
     // Post-seek landing: drop pre-roll frames (decoded from the keyframe before
     // the target) and keep the clock pinned to the target until the target frame
-    // is decoded. This must run before the lazy alignment below, which would
-    // otherwise anchor the clock to the first decoded frame (≈0) and undo the seek.
+    // is decoded.
     if (this.seekTarget !== null && this.lastRenderedPTS === -1) {
       while (this.frameQueue.length > 0 && this.frameQueue[0].pts < this.seekTarget) {
         const stale = this.frameQueue.shift()!;
@@ -420,12 +429,15 @@ export class PlaybackController {
           }
         }
         this.droppedFramesCount++;
+        this.droppedFrameTimes.push(performance.now());
       }
       if (this.frameQueue.length === 0) {
         // Target frame not decoded yet — hold the clock at the target so it
         // can't race ahead, and wait for the next decoded batch.
+        const nowWall = performance.now() / 1000;
         this.mediaStartClock = this.seekTarget;
-        this.playStartTime = performance.now() / 1000;
+        this.playStartTime = nowWall;
+        this.masterClock.setAnchor(this.seekTarget, nowWall);
         this.scheduleTick();
         return;
       }
@@ -436,8 +448,10 @@ export class PlaybackController {
 
     // Lazy timing alignment on the very first frame processed
     if (this.lastRenderedPTS === -1 && this.frameQueue.length > 0) {
+      const nowWall = performance.now() / 1000;
       this.mediaStartClock = this.frameQueue[0].pts;
-      this.playStartTime = performance.now() / 1000;
+      this.playStartTime = nowWall;
+      this.masterClock.setAnchor(this.mediaStartClock, nowWall);
 
       const audioTime = this.getAudioClock ? this.getAudioClock() : null;
       this.audioCtxStartOffset = audioTime;
@@ -453,9 +467,6 @@ export class PlaybackController {
     let bestFrame: DecodedFrame | null = null;
 
     // A/V Sync scheduling algorithm
-    // 100ms threshold for dropping laggy frames.
-    // Kept larger than the clock ahead threshold (80ms) so clock is corrected before frames are dropped.
-    const FRAME_LAG_THRESHOLD = 0.100; // 100ms in seconds
 
     while (this.frameQueue.length > 0) {
       const first = this.frameQueue[0];
@@ -472,6 +483,7 @@ export class PlaybackController {
           }
         }
         this.droppedFramesCount++;
+        this.droppedFrameTimes.push(performance.now());
       } else if (delta > 0.008) {
         // Frame is in the future. Wait for the clock to catch up.
         break;
@@ -516,12 +528,15 @@ export class PlaybackController {
       // A fresh frame painted — playback is no longer stalled.
       this.setBuffering(false);
     } else {
-      // Gap Detection: if no new frame rendered for >250ms, trigger placeholder frame
-      const GAP_THRESHOLD = 0.250; // 250ms
+      // Gap Detection: if no new frame rendered within threshold, signal buffering.
+      // Live streams have natural gaps at segment boundaries (~1–2s) while the
+      // loader fetches and decodes the next HLS segment. Use a generous 2s
+      // threshold for live to avoid false spinners; VOD keeps a tight 250ms.
+      const GAP_THRESHOLD = this.duration === Infinity ? TimingPolicy.GAP_THRESHOLD_LIVE : TimingPolicy.GAP_THRESHOLD_VOD;
       if (this.state === 'PLAYING' && this.lastRenderedPTS !== -1) {
         const timeSinceLastRendered = currentClock - this.lastRenderedPTS;
         const isQueueEmpty = this.frameQueue.length === 0;
-        const isNextFrameFarFuture = !isQueueEmpty && (this.frameQueue[0].pts - currentClock > 0.5);
+        const isNextFrameFarFuture = !isQueueEmpty && (this.frameQueue[0].pts - currentClock > TimingPolicy.NEXT_FRAME_FUTURE_THRESHOLD);
 
         if (timeSinceLastRendered > GAP_THRESHOLD && (isQueueEmpty || isNextFrameFarFuture)) {
           this.isDrawingGap = true;
@@ -543,6 +558,8 @@ export class PlaybackController {
   }
 
   private checkBackpressure() {
+    if (this.duration === Infinity) return;
+
     const len = this.frameQueue.length;
 
     if (!this.isBackpressurePaused && len >= this.maxQueueSize) {
@@ -557,10 +574,53 @@ export class PlaybackController {
   public destroy() {
     this.pause();
     this.flush();
+    this.stopSignalsInterval();
     this.getAudioClock = null;
     this.onRenderFrame = null;
     this.onBackpressureChange = null;
     this.onEnded = null;
     this.onBufferingChange = null;
+    this.onSignals = null;
+  }
+
+  private startSignalsInterval(): void {
+    this.stopSignalsInterval();
+    this.signalsInterval = setInterval(() => {
+      if (!this.onSignals) return;
+      const now = performance.now();
+      // Prune drop timestamps older than 1s
+      while (this.droppedFrameTimes.length > 0 && this.droppedFrameTimes[0] < now - 1000) {
+        this.droppedFrameTimes.shift();
+      }
+      // Prune rendered timestamps older than 1s
+      while (this.renderedFrameTimes.length > 0 && this.renderedFrameTimes[0] < now - 1000) {
+        this.renderedFrameTimes.shift();
+      }
+      // Average queue length over the sampling window
+      const avgQueueLen = this.queueLengthSamples.length > 0
+        ? this.queueLengthSamples.reduce((a, b) => a + b, 0) / this.queueLengthSamples.length
+        : this.frameQueue.length;
+      this.queueLengthSamples.length = 0;
+
+      const signals: StreamSignals = {
+        throughputKbps: 0,
+        throughputSamples: 0,
+        droppedFps: this.droppedFrameTimes.length,
+        effectiveFps: this.renderedFrameTimes.length,
+        targetFps: this.targetFps ?? 25,
+        avgQueueLen: Math.round(avgQueueLen * 10) / 10,
+        // proxy state: decoder is configured and actively producing frames
+        decoderReady: this.state === 'PLAYING' && this.lastRenderedPTS !== -1,
+        ts: now,
+      };
+      this.onSignals(signals);
+    }, 1000);
+  }
+
+  private stopSignalsInterval(): void {
+    if (this.signalsInterval) {
+      clearInterval(this.signalsInterval);
+      this.signalsInterval = null;
+    }
   }
 }

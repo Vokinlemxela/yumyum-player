@@ -476,14 +476,16 @@ function demuxStream(chunk: ArrayBuffer) {
         }
       }
       if (jpegStart !== -1) {
-        const jpegBuffer = esData.slice(jpegStart);
-        const transferable = jpegBuffer.buffer;
+        // ZERO-COPY TRANSFER: The underlying ArrayBuffer (esData.buffer) is exclusively owned
+        // by this message task and is transferred to the main thread. It must be posted only once,
+        // as it will be detached in the worker thread immediately following the postMessage call.
+        const transferable = esData.buffer;
         workerCtx.postMessage(
           {
             type: 'VIDEO',
             codec: 'mjpeg',
             pts: timeSeconds,
-            data: jpegBuffer,
+            data: new Uint8Array(transferable, esData.byteOffset + jpegStart, esData.byteLength - jpegStart),
             isKeyframe: true,
           },
           [transferable]
@@ -521,14 +523,17 @@ function demuxStream(chunk: ArrayBuffer) {
       }
     }
 
-    const transferableBuffer = esData.slice().buffer;
+    // ZERO-COPY TRANSFER: The underlying ArrayBuffer (esData.buffer) is exclusively owned
+    // by this message task and is transferred to the main thread. It must be posted only once,
+    // as it will be detached in the worker thread immediately following the postMessage call.
+    const transferableBuffer = esData.buffer;
     workerCtx.postMessage(
       {
         type: 'VIDEO',
         codec: config.videoCodec,
         parsedCodec,
         pts: timeSeconds,
-        data: new Uint8Array(transferableBuffer),
+        data: new Uint8Array(transferableBuffer, esData.byteOffset, esData.byteLength),
         isKeyframe,
       },
       [transferableBuffer]
@@ -718,14 +723,16 @@ function processVideoPES(pes: Uint8Array, ptsRaw: number) {
       }
     }
     if (jpegStart !== -1) {
-      const jpegBuffer = esData.slice(jpegStart);
-      const transferable = jpegBuffer.buffer;
+      // ZERO-COPY TRANSFER: The underlying ArrayBuffer (pes.buffer) is exclusively owned
+      // by this message task and is transferred to the main thread. It must be posted only once,
+      // as it will be detached in the worker thread immediately following the postMessage call.
+      const transferable = pes.buffer;
       workerCtx.postMessage(
         {
           type: 'VIDEO',
           codec: 'mjpeg',
           pts: timeSeconds,
-          data: jpegBuffer,
+          data: new Uint8Array(transferable, esData.byteOffset + jpegStart, esData.byteLength - jpegStart),
           isKeyframe: true,
         },
         [transferable]
@@ -764,15 +771,17 @@ function processVideoPES(pes: Uint8Array, ptsRaw: number) {
     }
   }
 
-  // Transfer elementary streams to main thread (zero-copy)
-  const transferableBuffer = esData.slice().buffer;
+  // ZERO-COPY TRANSFER: The underlying ArrayBuffer (pes.buffer) is exclusively owned
+  // by this message task and is transferred to the main thread. It must be posted only once,
+  // as it will be detached in the worker thread immediately following the postMessage call.
+  const transferableBuffer = pes.buffer;
   workerCtx.postMessage(
     {
       type: 'VIDEO',
       codec: config.videoCodec,
       parsedCodec,
       pts: timeSeconds,
-      data: new Uint8Array(transferableBuffer),
+      data: new Uint8Array(transferableBuffer, esData.byteOffset, esData.byteLength),
       isKeyframe,
     },
     [transferableBuffer]

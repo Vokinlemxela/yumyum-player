@@ -84,4 +84,62 @@ describe('AudioMasterClock', () => {
     clock.update(8.0, 200);
     expect(clock.read(200)).toBeCloseTo(8.0, 6);
   });
+
+  it('supports manual anchor setting and manual getters', () => {
+    const clock = new AudioMasterClock();
+    clock.setAnchor(12.0, 300);
+    expect(clock.isAnchored).toBe(true);
+    expect(clock.anchorPts).toBe(12.0);
+    expect(clock.audioAcquired).toBe(false);
+    expect(clock.read(305)).toBeCloseTo(17.0, 6); // Freewheel at 1x
+  });
+
+  it('gates update based on adoptTolerance and seekResyncTolerance', () => {
+    const clock = new AudioMasterClock({
+      adoptTolerance: 2.0,
+      seekResyncTolerance: 0.5,
+    });
+
+    clock.setAnchor(10.0, 100);
+    expect(clock.audioAcquired).toBe(false);
+
+    // Update with gap > 2.0 (13.0 at ctxNow=100. Gap is 3.0s). Rejected.
+    clock.update(13.0, 100);
+    expect(clock.audioAcquired).toBe(false);
+    expect(clock.read(100)).toBeCloseTo(10.0, 6);
+
+    // Update with gap <= 2.0 (11.5 at ctxNow=100. Gap is 1.5s). Accepted.
+    clock.update(11.5, 100);
+    expect(clock.audioAcquired).toBe(true);
+    expect(clock.read(100)).toBeCloseTo(11.5, 6);
+
+    // Once acquired, seekResyncTolerance of 0.5 is checked instead of 2.0.
+    clock.update(13.2, 101); // Predicted 12.5. Gap is 0.7 > 0.5. Rejected.
+    expect(clock.read(101)).toBeCloseTo(12.5, 6);
+
+    // Update with gap <= 0.5 (12.8 at ctxNow=101. Gap is 0.3s). Accepted.
+    clock.update(12.8, 101);
+    expect(clock.read(101)).toBeCloseTo(12.8, 6);
+  });
+
+  it('supports underrun hold and time freezing', () => {
+    const clock = new AudioMasterClock({
+      underrunHold: 1.0,
+    });
+
+    clock.update(5.0, 100);
+    expect(clock.audioAcquired).toBe(true);
+
+    // Send null reported PTS to enter underrun hold state
+    clock.update(null, 100);
+    // Within 1.0s, read() should freeze at the last audio PTS (5.0)
+    expect(clock.read(100.5)).toBeCloseTo(5.0, 6);
+    expect(clock.audioAcquired).toBe(true);
+
+    // Exceeding 1.0s underrun hold limit
+    clock.update(null, 101.5); // 1.5s passed. Should lose lock and freewheel from last audio PTS (5.0)
+    expect(clock.audioAcquired).toBe(false);
+    // Freewheel from 5.0 at ctxNow=101.5. At ctxNow=102.5, time should be 6.0
+    expect(clock.read(102.5)).toBeCloseTo(6.0, 6);
+  });
 });

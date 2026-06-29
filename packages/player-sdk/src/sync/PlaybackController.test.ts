@@ -216,6 +216,7 @@ describe('PlaybackController playback rate', () => {
 
     it('optimizes queue limits and sets default FPS when lowPower is true', () => {
       const c = new PlaybackController(null, null, null, null, null, undefined, undefined, true, new Logger('test', 'silent'));
+      c.duration = 60;
       const diag = c.getDiagnostics();
       
       // When lowPower is active, maxQueueSize defaults to 5.
@@ -232,6 +233,7 @@ describe('PlaybackController playback rate', () => {
         true,
         new Logger('test', 'silent')
       );
+      bpController.duration = 60;
 
       for (let i = 0; i < 5; i++) {
         bpController.enqueueFrame({ pts: i * 0.2, duration: 0.2, data: { close: vi.fn() } as any });
@@ -262,6 +264,7 @@ describe('PlaybackController playback rate', () => {
       const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
       const events: boolean[] = [];
       const c = makeBufferingController(events);
+      c.duration = 60; // finite = VOD → 250ms GAP_THRESHOLD
       c.start();
 
       // Render one frame so lastRenderedPTS is set and gap detection can engage.
@@ -287,6 +290,7 @@ describe('PlaybackController playback rate', () => {
       const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
       const events: boolean[] = [];
       const c = makeBufferingController(events);
+      c.duration = 60; // VOD → 250ms threshold
       c.start();
 
       c.enqueueFrame({ pts: 0, duration: 0.04, data: { close: vi.fn() } as any });
@@ -309,6 +313,7 @@ describe('PlaybackController playback rate', () => {
       const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
       const events: boolean[] = [];
       const c = makeBufferingController(events);
+      c.duration = 60; // VOD → 250ms threshold
       c.start();
       c.enqueueFrame({ pts: 0, duration: 0.04, data: { close: vi.fn() } as any });
       (c as any).tick();
@@ -327,6 +332,7 @@ describe('PlaybackController playback rate', () => {
       const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
       const events: boolean[] = [];
       const c = makeBufferingController(events);
+      c.duration = 60; // VOD → 250ms threshold
       c.start();
       c.enqueueFrame({ pts: 0, duration: 0.04, data: { close: vi.fn() } as any });
       (c as any).tick();
@@ -337,6 +343,30 @@ describe('PlaybackController playback rate', () => {
       c.seek(10); // flush() resets the stall
       expect(c.isBuffering).toBe(false);
       expect(events).toEqual([true, false]);
+
+      c.destroy();
+    });
+
+    it('uses higher threshold for live (duration=Infinity) to avoid segment-gap spinners', () => {
+      const now = vi.spyOn(performance, 'now').mockReturnValue(1000);
+      const events: boolean[] = [];
+      const c = makeBufferingController(events);
+      // duration defaults to Infinity (live) → 2s GAP_THRESHOLD
+      c.start();
+      c.enqueueFrame({ pts: 0, duration: 0.04, data: { close: vi.fn() } as any });
+      (c as any).tick();
+
+      // +1s gap — within the live 2s threshold → no buffering signal.
+      now.mockReturnValue(2000);
+      (c as any).tick();
+      expect(c.isBuffering).toBe(false);
+      expect(events).toEqual([]);
+
+      // +2.5s gap — exceeds the 2s threshold → buffering starts.
+      now.mockReturnValue(3500);
+      (c as any).tick();
+      expect(c.isBuffering).toBe(true);
+      expect(events).toEqual([true]);
 
       c.destroy();
     });
@@ -462,6 +492,259 @@ describe('PlaybackController playback rate', () => {
       expect(renderedFrame).toBeNull();
       expect(c.getCurrentTime()).toBeCloseTo(0.0, 6);
     });
+
+    it('prevents flapping in live clock drift correction via cooldown logic', () => {
+      // Set performance.now() to start at 3000ms (3.0s) so that the first tick (which
+      // triggers the cooldown start) is far past 0, letting the first drift correction
+      // pass the cooldown filter.
+      const now = vi.spyOn(performance, 'now').mockReturnValue(3000); 
+      let renderCount = 0;
+      const c = new PlaybackController(
+        null,
+        () => { renderCount++; },
+        null,
+        null,
+        null,
+        25, // targetFps = 25
+        25, // renderFps = 25
+        undefined,
+        new Logger('test', 'silent')
+      );
+      c.duration = Infinity; // Live stream
+      c.start();
+
+      // Initial alignment: f1 PTS is 0.0
+      c.enqueueFrame({ pts: 0.0, duration: 0.04, data: {} as any });
+      (c as any).tick(); // aligned to 0.0, clock at 0.0
+
+      // We can mock masterClock.setAnchor to spy on it:
+      const setAnchorSpy = vi.spyOn((c as any).masterClock, 'setAnchor');
+
+      // 1. Trigger a small drift correction forward (pts is 0.09s, clock is at 0.0s -> diff 0.09s > 0.08s)
+      now.mockReturnValue(3000); // clock = 0
+      c.enqueueFrame({ pts: 0.09, duration: 0.04, data: {} as any });
+      (c as any).tick();
+      expect(setAnchorSpy).toHaveBeenCalledTimes(1); // corrected!
+      expect((c as any).lastCorrectionTime).toBe(3000 / 1000); // 3.0
+
+      setAnchorSpy.mockClear();
+
+      // 2. Trigger another drift correction forward immediately after (10ms later: now = 3010ms).
+      // Since it is only 10ms after the first correction, it should be BLOCKED by the 2.0s cooldown!
+      now.mockReturnValue(3010); // +10ms
+      c.enqueueFrame({ pts: 0.19, duration: 0.04, data: {} as any });
+      (c as any).tick();
+      expect(setAnchorSpy).not.toHaveBeenCalled(); // blocked by cooldown!
+
+      // 3. Advance wall clock by 2.1s (now = 5110ms)
+      // The cooldown is now elapsed. Let's trigger another correction.
+      now.mockReturnValue(5110);
+      // Clear the late frame that is still in the queue so it doesn't block correction
+      (c as any).frameQueue = [];
+      // Predicted clock = 0.09 + 2.1 = 2.19s. PTS = 2.30s -> diff = 0.11s > 0.08s.
+      c.enqueueFrame({ pts: 2.30, duration: 0.04, data: {} as any });
+      (c as any).tick();
+      expect(setAnchorSpy).toHaveBeenCalledTimes(1); // corrected after cooldown elapsed!
+    });
+
+    it('bypasses cooldown for large discontinuities in live clock drift correction', () => {
+      const now = vi.spyOn(performance, 'now').mockReturnValue(3000);
+      const c = new PlaybackController(
+        null,
+        () => {},
+        null,
+        null,
+        null,
+        25,
+        25,
+        undefined,
+        new Logger('test', 'silent')
+      );
+      c.duration = Infinity;
+      c.start();
+
+      // Initial alignment: f1 PTS is 0.0
+      c.enqueueFrame({ pts: 0.0, duration: 0.04, data: {} as any });
+      (c as any).tick();
+
+      const setAnchorSpy = vi.spyOn((c as any).masterClock, 'setAnchor');
+
+      // 1. Trigger small correction
+      c.enqueueFrame({ pts: 0.09, duration: 0.04, data: {} as any });
+      (c as any).tick();
+      expect(setAnchorSpy).toHaveBeenCalledTimes(1);
+      setAnchorSpy.mockClear();
+
+      // 2. Trigger huge correction immediately after (10ms later).
+      // diff is 0.6s > 0.15s (discontinuity). Cooldown should be bypassed!
+      now.mockReturnValue(3010);
+      c.enqueueFrame({ pts: 0.70, duration: 0.04, data: {} as any }); // clock is 0.09 + 0.01 = 0.10. diff = 0.6s
+      (c as any).tick();
+      expect(setAnchorSpy).toHaveBeenCalledTimes(1); // bypassed cooldown!
+    });
+
+    it('drops frames to catch up when the live queue exceeds catchupThreshold', () => {
+      const c = new PlaybackController(
+        null,
+        () => {},
+        null,
+        null,
+        null,
+        25, // targetFps = 25
+        25, // renderFps = 25
+        undefined,
+        new Logger('test', 'silent')
+      );
+      c.duration = Infinity; // Live
+      c.start();
+
+      // Alignment
+      c.enqueueFrame({ pts: 0.0, duration: 0.04, data: { close: vi.fn() } as any });
+      (c as any).tick();
+
+      // catchupThreshold is Math.max(150, fps * CATCHUP_THRESHOLD_MULT (6)) = Math.max(150, 150) = 150 frames.
+      // Let's enqueue 160 frames. Start at i = 1 to avoid frame decimation collision with the first aligned frame.
+      const closeSpies: any[] = [];
+      for (let i = 1; i <= 160; i++) {
+        const closeSpy = vi.fn();
+        c.enqueueFrame({ pts: i * 0.04, duration: 0.04, data: { close: closeSpy } as any });
+        closeSpies.push(closeSpy);
+      }
+
+      // Check current queue length before tick
+      expect((c as any).frameQueue.length).toBe(160);
+
+      // Run tick: it should trigger queue size catchup and drop frames down to catchupTarget.
+      // catchupTarget = Math.max(60, fps * CATCHUP_TARGET_MULT (2.5)) = Math.max(60, 62) = 62 frames.
+      // So it should drop: 160 - 62 = 98 frames.
+      // 1 frame of the remaining 62 is also consumed/rendered by this tick, leaving 61 in the queue.
+      (c as any).tick();
+
+      expect((c as any).frameQueue.length).toBe(61);
+      expect((c as any).droppedFramesCount).toBe(98);
+      // Verify that dropped frames were closed (indices 0 to 97 corresponding to i = 1 to 98)
+      for (let i = 0; i < 98; i++) {
+        expect(closeSpies[i]).toHaveBeenCalledTimes(1);
+      }
+      // Frame at index 98 (i = 99) was rendered, so it was also closed
+      expect(closeSpies[98]).toHaveBeenCalledTimes(1);
+      // Remaining frames (indices 99 to 159) should not be closed
+      for (let i = 99; i < 160; i++) {
+        expect(closeSpies[i]).not.toHaveBeenCalled();
+      }
+    });
+  });
+});
+
+
+describe('PlaybackController signals interval', () => {
+  it('fires onSignals callback at 1 Hz with headroom data', async () => {
+    vi.useFakeTimers();
+    const signals: any[] = [];
+    const c = new PlaybackController(
+      null, null, null, null, null,
+      25, undefined, undefined,
+      new Logger('test', 'silent'),
+      (s) => signals.push({ ...s }),
+    );
+    // Advance 1 second to trigger the interval
+    vi.advanceTimersByTime(1000);
+    expect(signals.length).toBe(1);
+    expect(signals[0].targetFps).toBe(25);
+    expect(signals[0].throughputKbps).toBe(0); // no loader enrichment
+    expect(signals[0].droppedFps).toBe(0);
+    expect(typeof signals[0].avgQueueLen).toBe('number');
+    expect(typeof signals[0].ts).toBe('number');
+    c.destroy();
+    vi.useRealTimers();
+  });
+
+  it('reports droppedFps accurately from dropped frame timestamps', async () => {
+    vi.useFakeTimers();
+    const signals: any[] = [];
+    const c = new PlaybackController(
+      null, null, null, null, null,
+      undefined, undefined, undefined,
+      new Logger('test', 'silent'),
+      (s) => signals.push({ ...s }),
+    );
+    // Advance to a non-zero time so timestamps are valid
+    vi.advanceTimersByTime(500);
+    // Simulate drops by manually pushing timestamps within the last 1s
+    const now = performance.now();
+    (c as any).droppedFrameTimes.push(now - 200);
+    (c as any).droppedFrameTimes.push(now - 100);
+    (c as any).droppedFrameTimes.push(now - 50);
+
+    vi.advanceTimersByTime(500);
+    expect(signals.length).toBe(1);
+    expect(signals[0].droppedFps).toBe(3);
+    c.destroy();
+    vi.useRealTimers();
+  });
+
+  it('stops the interval on destroy', async () => {
+    vi.useFakeTimers();
+    const signals: any[] = [];
+    const c = new PlaybackController(
+      null, null, null, null, null,
+      undefined, undefined, undefined,
+      new Logger('test', 'silent'),
+      (s) => signals.push({ ...s }),
+    );
+    c.destroy();
+    vi.advanceTimersByTime(3000);
+    expect(signals.length).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it('computes avgQueueLen from tick samples', async () => {
+    vi.useFakeTimers();
+    const signals: any[] = [];
+    const c = new PlaybackController(
+      null, null, null, null, null,
+      undefined, undefined, undefined,
+      new Logger('test', 'silent'),
+      (s) => signals.push({ ...s }),
+    );
+    // Manually push queue length samples
+    (c as any).queueLengthSamples.push(10, 20, 30);
+
+    vi.advanceTimersByTime(1000);
+    expect(signals.length).toBe(1);
+    expect(signals[0].avgQueueLen).toBe(20); // (10+20+30)/3 = 20
+    // Samples should be cleared after emission
+    expect((c as any).queueLengthSamples.length).toBe(0);
+    c.destroy();
+    vi.useRealTimers();
+  });
+
+  it('prunes renderedFrameTimes in tick() to prevent memory leak without getDiagnostics()', () => {
+    const c = new PlaybackController(
+      null, null, null, null, null,
+      undefined, undefined, undefined,
+      new Logger('test', 'silent')
+    );
+    c.start();
+    const ctrl = c as any;
+
+    // Simulate rendering 100 frames at old timestamps
+    const nowSpy = vi.spyOn(performance, 'now');
+    nowSpy.mockReturnValue(1000);
+    for (let i = 0; i < 100; i++) {
+      ctrl.renderedFrameTimes.push(1000);
+    }
+    expect(ctrl.renderedFrameTimes.length).toBe(100);
+
+    // Advance time by 2 seconds and call tick()
+    nowSpy.mockReturnValue(3000);
+    ctrl.tick();
+
+    // After tick() is processed, all timestamps older than 3000 - 1000 = 2000 should be pruned!
+    expect(ctrl.renderedFrameTimes.length).toBe(0);
+
+    c.destroy();
+    nowSpy.mockRestore();
   });
 });
 

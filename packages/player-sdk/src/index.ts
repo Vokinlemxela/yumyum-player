@@ -22,6 +22,9 @@ import { PlaybackController, DecodedFrame } from './sync/PlaybackController.js';
 import { StreamLoader } from './network/StreamLoader.js';
 import { LoaderRegistry } from './network/LoaderRegistry.js';
 import { IStreamLoader, LoaderDeps, WallClockRange } from './network/IStreamLoader.js';
+import { QualityLevel, QualitySource } from './quality/QualitySource.js';
+import { QualityController } from './quality/QualityController.js';
+import { StreamSignals } from './quality/Signals.js';
 import { PlayerPlugin, PluginContext } from './plugin/types.js';
 import {
   DecoderRegistry,
@@ -103,9 +106,19 @@ export interface PlayerTelemetry {
   decodedFrames?: number;
   /** Current effective rendering frames per second. */
   effectiveFps?: number;
+  /** Smoothed network throughput in Kbps (EWMA). */
+  throughputKbps?: number;
+  /** Current ABR quality controller mode ('auto' | 'manual'). */
+  qualityMode?: 'auto' | 'manual';
+  /** Reason for the last adaptive quality switch. */
+  lastSwitchReason?: string;
+  /** Current maximum allowed quality kind restriction ('main' | 'sub' | null). */
+  maxAllowedKind?: 'main' | 'sub' | null;
+  /** Current rendering mode status. */
+  renderMode?: string;
 }
 
-export type PlayerEvent = 'play' | 'pause' | 'error' | 'ended' | 'waiting' | 'playing';
+export type PlayerEvent = 'play' | 'pause' | 'error' | 'ended' | 'waiting' | 'playing' | 'qualitychange' | 'signals' | 'renderfallback';
 export type PlayerLifecycleState = 'IDLE' | 'LOADING' | 'LOADED' | 'PLAYING' | 'PAUSED' | 'DESTROYED';
 
 // Re-export useful types for advanced consumers
@@ -116,6 +129,10 @@ export type { IBaseDecoder } from './decode/DecoderRegistry.js';
 export { Logger } from './utils/Logger.js';
 export type { LogLevel } from './utils/Logger.js';
 export type { Segment } from './network/StreamLoader.js';
+export type { QualityLevel, QualitySource } from './quality/QualitySource.js';
+export { QualityController } from './quality/QualityController.js';
+export type { QualityControllerOptions } from './quality/QualityController.js';
+export type { StreamSignals } from './quality/Signals.js';
 // Extension API for plugins (Pro modules)
 export type { PlayerPlugin, PluginContext, DecoderFactory, DecoderDeps } from './plugin/types.js';
 export type { IStreamLoader, LoaderFactory, LoaderDeps, LoaderKind, SegmentMeta, WallClockRange } from './network/IStreamLoader.js';
@@ -131,6 +148,7 @@ export class YumYumPlayer {
   private activeLoader: IStreamLoader | null = null;
   private decoders: DecoderRegistry;
   private logger: Logger;
+  private qualityController: QualityController;
 
   private worker: Worker | null = null;
   private workerBlobUrl: string | null = null;
@@ -143,6 +161,7 @@ export class YumYumPlayer {
   private lifecycleState: PlayerLifecycleState = 'IDLE';
   private lastError: Error | null = null;
   private audioUnlockCleanup: (() => void) | null = null;
+  private lastSignals: StreamSignals | null = null;
 
   /** Get the current player lifecycle state */
   public get state(): PlayerLifecycleState {
@@ -213,8 +232,28 @@ export class YumYumPlayer {
   constructor(private config: PlayerConfig) {
     this.logger = new Logger('YumYumPlayer', config.logLevel || 'silent');
 
+    const playerQualitySource: QualitySource = {
+      getLevels: () => this.activeLoader?.quality?.getLevels() ?? [],
+      getActiveId: () => this.activeLoader?.quality?.getActiveId() ?? '',
+      switchQuality: (id) => this.activeLoader?.quality?.switchQuality(id),
+    };
+    this.qualityController = new QualityController(
+      playerQualitySource,
+      this.logger.createChild('QualityController')
+    );
+
     // 1. Initialize Video WebGL2 Renderer
     this.videoRenderer = new WebGLVideoRenderer(config.canvas, config.placeholderStyle || 'black', this.logger.createChild('WebGLVideoRenderer'));
+    this.videoRenderer.onFallback = (reason) => {
+      this.logger.warn(`YumYumPlayer: render fallback occurred. Reason: ${reason}`);
+      this.emit('renderfallback', reason);
+      if (reason === 'overflow') {
+        this.setLowPower(true);
+        this.setQuality('sub').catch((err) => {
+          this.logger.debug('Failed to switch to sub quality during render fallback demotion:', err);
+        });
+      }
+    };
 
     // 2. Initialize PCM AudioWorklet
     this.audioRenderer = new PCMAudioWorklet(this.logger.createChild('PCMAudioWorklet'));
@@ -270,7 +309,19 @@ export class YumYumPlayer {
       config.targetFps,
       config.renderFps,
       config.lowPower,
-      this.logger.createChild('PlaybackController')
+      this.logger.createChild('PlaybackController'),
+      (signals) => {
+        // Enrich decode-headroom signals with loader throughput
+        const tp = this.activeLoader?.getThroughput?.();
+        if (tp) {
+          signals.throughputKbps = tp.throughputKbps;
+          signals.throughputSamples = tp.throughputSamples;
+        }
+        this.lastSignals = signals;
+        const isLive = this.getDuration() === Infinity;
+        this.qualityController.reportSignals(signals, isLive);
+        this.emit('signals', signals);
+      },
     );
 
     // 4. Initialize Decoders Registry
@@ -546,6 +597,73 @@ export class YumYumPlayer {
     }
   }
 
+  /** Get list of available quality levels */
+  public getQualityLevels(): QualityLevel[] {
+    if (this.activeLoader?.quality) {
+      return this.activeLoader.quality.getLevels();
+    }
+    return [];
+  }
+
+  /** Get active quality level ID */
+  public getActiveQuality(): string {
+    if (this.qualityController.getMode() === 'auto') {
+      return 'auto';
+    }
+    if (this.activeLoader?.quality) {
+      return this.activeLoader.quality.getActiveId();
+    }
+    return '';
+  }
+
+  /** Set quality level by ID, alias ('main' | 'sub') or 'auto' */
+  public async setQuality(id: string): Promise<void> {
+    if (id === 'auto') {
+      this.qualityController.setMode('auto');
+      this.emit('qualitychange', 'auto');
+      return;
+    }
+
+    this.qualityController.setMode('manual');
+
+    if (this.activeLoader?.quality) {
+      let resolvedId = id;
+      if (id === 'main' || id === 'sub') {
+        const levels = this.activeLoader.quality.getLevels();
+        const matchingLevel = levels.find(l => l.kind === id);
+        if (matchingLevel) {
+          resolvedId = matchingLevel.id;
+        }
+      }
+      
+      const activeId = this.activeLoader.quality.getActiveId();
+      if (activeId === resolvedId) return;
+      
+      await this.activeLoader.quality.switchQuality(resolvedId);
+      this.emit('qualitychange', resolvedId);
+    }
+  }
+
+  /** Get current ABR quality controller mode */
+  public getQualityMode(): 'auto' | 'manual' {
+    return this.qualityController.getMode();
+  }
+
+  /** Set ABR quality controller mode */
+  public setQualityMode(mode: 'auto' | 'manual'): void {
+    this.qualityController.setMode(mode);
+  }
+
+  /** Get maximum allowed quality kind constraint */
+  public getMaxQualityKind(): 'main' | 'sub' | null {
+    return this.qualityController.getMaxQualityKind();
+  }
+
+  /** Set maximum allowed quality kind constraint (e.g. for grid density limiting) */
+  public setMaxQualityKind(kind: 'main' | 'sub' | null): void {
+    this.qualityController.setMaxQualityKind(kind);
+  }
+
   /** Start or resume playback */
   public async play(): Promise<void> {
     if (this.lifecycleState === 'DESTROYED') {
@@ -566,7 +684,9 @@ export class YumYumPlayer {
     // AbortError. Awaiting it here would abort the whole play() — and thus video
     // — for muted autoplay (allowed by policy). Audio re-resumes on the next
     // gesture (see setVolume/setMuted/setPlaybackRate, which also call resume()).
-    void this.audioRenderer.resume().catch(() => {});
+    void this.audioRenderer.resume().catch((err) => {
+      this.logger.debug('Failed to resume audioRenderer in play():', err);
+    });
     this.playbackController.start();
     // `push` loaders stream on connect and treat this as a no-op.
     this.activeLoader?.start(() => this.isBackpressurePaused);
@@ -631,7 +751,9 @@ export class YumYumPlayer {
   public setVolume(volume: number): void {
     this.audioRenderer.setVolume(volume);
     if (volume > 0) {
-      this.audioRenderer.resume().catch(() => {});
+      this.audioRenderer.resume().catch((err) => {
+        this.logger.debug('Failed to resume audioRenderer in setVolume:', err);
+      });
     }
   }
 
@@ -646,7 +768,9 @@ export class YumYumPlayer {
     if (!isMuted && this.audioRenderer.state !== 'running') {
       // Re-resume the AudioContext if it got suspended (e.g. Safari policy).
       // This is a no-op if the context is already running.
-      this.audioRenderer.resume().catch(() => {});
+      this.audioRenderer.resume().catch((err) => {
+        this.logger.debug('Failed to resume audioRenderer in mute:', err);
+      });
     }
   }
 
@@ -671,13 +795,20 @@ export class YumYumPlayer {
     // Mute while sped up / slowed down; restore the user's choice at 1x.
     this.audioRenderer.mute(clamped !== 1 ? true : this.userMuted);
     if (clamped === 1 && !this.userMuted && this.audioRenderer.state !== 'running') {
-      this.audioRenderer.resume().catch(() => {});
+      this.audioRenderer.resume().catch((err) => {
+        this.logger.debug('Failed to resume audioRenderer in setPlaybackRate:', err);
+      });
     }
   }
 
   /** Get the current playback speed multiplier. */
   public getPlaybackRate(): number {
     return this.playbackController.getPlaybackRate();
+  }
+
+  /** Set the player into economical lowPower mode dynamically */
+  public setLowPower(lowPower: boolean): void {
+    this.playbackController.setLowPower(lowPower);
   }
 
   /** Get the current playback position in seconds. */
@@ -709,6 +840,11 @@ export class YumYumPlayer {
           ? 'ImageBitmap (CPU)'
           : 'WebCodecs (GPU)',
       lastError: this.lastError ? this.lastError.message : undefined,
+      throughputKbps: this.lastSignals?.throughputKbps,
+      qualityMode: this.qualityController.getMode(),
+      lastSwitchReason: this.qualityController.getDiagnostics().lastSwitchReason,
+      maxAllowedKind: this.qualityController.getMaxQualityKind(),
+      renderMode: this.videoRenderer.getRenderMode(),
     };
   }
 

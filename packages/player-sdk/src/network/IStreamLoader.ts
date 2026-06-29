@@ -1,4 +1,5 @@
 import { Logger } from '../utils/Logger.js';
+import { QualitySource } from '../quality/QualitySource.js';
 
 /**
  * How the player drives a loader:
@@ -62,6 +63,7 @@ export interface LoaderDeps {
  */
 export interface IStreamLoader {
   readonly kind: LoaderKind;
+  readonly quality?: QualitySource;
   /** Connect to / load the URL. Resolves when ready to begin playback. */
   load(url: string): Promise<void>;
   /** Begin fetching. No-op for `push` loaders that stream on connect. */
@@ -79,6 +81,8 @@ export interface IStreamLoader {
    * loaders may omit it.
    */
   getBufferedEnd?(): number;
+  /** Get current throughput estimation (in Kbps) and number of samples */
+  getThroughput?(): { throughputKbps: number; throughputSamples: number };
   /**
    * Whether this loader exposes a wall-clock (PROGRAM-DATE-TIME) timeline.
    * Only archive VOD loaders return `true`; live / progressive / mock omit it.

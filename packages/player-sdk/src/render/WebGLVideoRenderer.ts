@@ -1,4 +1,5 @@
 import { Logger } from '../utils/Logger.js';
+import { WebGLContextPool } from './WebGLContextPool.js';
 
 export interface YUVFrameData {
   width: number;
@@ -46,6 +47,28 @@ export class WebGLVideoRenderer {
   private lastYuvLogTime = 0;
   private cachedImageData: ImageData | null = null;
 
+  // Context Pool & observablity properties
+  private hasGLSlot = false;
+  private hasJSSlot = false;
+  private isOverflow = false;
+  private currentRenderMode: 'webgl' | '2d-fallback' | '2d-overflow' | 'js-fallback' | 'js-fallback-dropped' = 'webgl';
+
+  public onFallback?: (reason: 'overflow' | 'lost' | 'unavailable') => void;
+
+  // Cached locations to prevent dynamically querying them on the hot path
+  private yuvLocations = {
+    aPos: -1,
+    aTex: -1,
+    uY: null as WebGLUniformLocation | null,
+    uU: null as WebGLUniformLocation | null,
+    uV: null as WebGLUniformLocation | null,
+  };
+  private rgbaLocations = {
+    aPos: -1,
+    aTex: -1,
+    uRgba: null as WebGLUniformLocation | null,
+  };
+
   constructor(
     private canvas: HTMLCanvasElement,
     private placeholderStyle: 'black' | 'no-signal' | 'none' = 'black',
@@ -59,24 +82,44 @@ export class WebGLVideoRenderer {
     e.preventDefault();
     this.logger.warn('WebGL context lost.');
     this.isFallbackMode = true;
+    this.onFallback?.('lost');
+    if (this.hasGLSlot) {
+      WebGLContextPool.releaseGLSlot(this);
+      this.hasGLSlot = false;
+    }
   };
 
   private handleContextRestored = () => {
-    this.logger.debug('WebGL context restored.');
-    this.isFallbackMode = false;
-    this.gl = null;
-    this.yuvProgram = null;
-    this.rgbaProgram = null;
-    this.vertexShader = null;
-    this.yuvFragmentShader = null;
-    this.rgbaFragmentShader = null;
-    this.buffer = null;
-    this.yTexture = null;
-    this.uTexture = null;
-    this.vTexture = null;
-    this.rgbaTexture = null;
-    this.lastRgbaWidth = 0;
-    this.lastRgbaHeight = 0;
+    this.logger.debug('WebGL context restored. Re-acquiring GL slot.');
+    this.hasGLSlot = WebGLContextPool.acquireGLSlot(this);
+    
+    if (this.hasGLSlot) {
+      if (this.hasJSSlot) {
+        WebGLContextPool.releaseJSSlot(this);
+        this.hasJSSlot = false;
+      }
+      this.isFallbackMode = false;
+      this.isOverflow = false;
+      this.currentRenderMode = 'webgl';
+      this.gl = null;
+      this.yuvProgram = null;
+      this.rgbaProgram = null;
+      this.vertexShader = null;
+      this.yuvFragmentShader = null;
+      this.rgbaFragmentShader = null;
+      this.buffer = null;
+      this.yTexture = null;
+      this.uTexture = null;
+      this.vTexture = null;
+      this.rgbaTexture = null;
+      this.lastRgbaWidth = 0;
+      this.lastRgbaHeight = 0;
+    } else {
+      this.isFallbackMode = true;
+      this.isOverflow = true;
+      this.currentRenderMode = '2d-overflow';
+      this.onFallback?.('overflow');
+    }
   };
 
   private initWebGL() {
@@ -198,14 +241,24 @@ export class WebGLVideoRenderer {
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
     gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
 
-    // Setup uniform locations
+    // Setup uniform and attribute locations
+    this.yuvLocations.aPos = gl.getAttribLocation(this.yuvProgram, 'a_position');
+    this.yuvLocations.aTex = gl.getAttribLocation(this.yuvProgram, 'a_texCoord');
+    this.yuvLocations.uY = gl.getUniformLocation(this.yuvProgram, 'u_yTexture');
+    this.yuvLocations.uU = gl.getUniformLocation(this.yuvProgram, 'u_uTexture');
+    this.yuvLocations.uV = gl.getUniformLocation(this.yuvProgram, 'u_vTexture');
+
+    this.rgbaLocations.aPos = gl.getAttribLocation(this.rgbaProgram, 'a_position');
+    this.rgbaLocations.aTex = gl.getAttribLocation(this.rgbaProgram, 'a_texCoord');
+    this.rgbaLocations.uRgba = gl.getUniformLocation(this.rgbaProgram, 'u_rgbaTexture');
+
     gl.useProgram(this.yuvProgram);
-    gl.uniform1i(gl.getUniformLocation(this.yuvProgram, 'u_yTexture'), 0);
-    gl.uniform1i(gl.getUniformLocation(this.yuvProgram, 'u_uTexture'), 1);
-    gl.uniform1i(gl.getUniformLocation(this.yuvProgram, 'u_vTexture'), 2);
+    gl.uniform1i(this.yuvLocations.uY, 0);
+    gl.uniform1i(this.yuvLocations.uU, 1);
+    gl.uniform1i(this.yuvLocations.uV, 2);
 
     gl.useProgram(this.rgbaProgram);
-    gl.uniform1i(gl.getUniformLocation(this.rgbaProgram, 'u_rgbaTexture'), 0);
+    gl.uniform1i(this.rgbaLocations.uRgba, 0);
   }
 
   private fallbackTo2D() {
@@ -287,14 +340,18 @@ export class WebGLVideoRenderer {
     }
   }
 
-  public renderYUV(frame: YUVFrameData) {
-    if (!this.gl && !this.canvas2dCtx) {
-      // Probe WebGL2 on a throwaway canvas first. A canvas that has acquired any
-      // webgl context can never return a 2D context afterwards — so if WebGL2 or
-      // shader compilation is broken in this browser, we must NOT touch this
-      // canvas with webgl, otherwise the 2D fallback can't get a context and
-      // rendering dies (createImageData on null).
-      if (WebGLVideoRenderer.webgl2Usable()) {
+  public getRenderMode(): 'webgl' | '2d-fallback' | '2d-overflow' | 'js-fallback' | 'js-fallback-dropped' {
+    return this.currentRenderMode;
+  }
+
+  private tryInitWebGL(): boolean {
+    if (this.gl || this.canvas2dCtx) {
+      return !!this.gl;
+    }
+
+    if (WebGLVideoRenderer.webgl2Usable()) {
+      this.hasGLSlot = WebGLContextPool.acquireGLSlot(this);
+      if (this.hasGLSlot) {
         this.gl = this.canvas.getContext('webgl2', {
           alpha: false,
           depth: false,
@@ -304,16 +361,43 @@ export class WebGLVideoRenderer {
           preserveDrawingBuffer: true,
           powerPreference: 'high-performance',
         });
-      }
-
-      if (this.gl) {
-        this.initWebGL();
       } else {
-        this.logger.warn('WebGL2 unavailable; rendering YUV via 2D canvas.');
-        this.canvas2dCtx = this.canvas.getContext('2d');
+        this.logger.warn('WebGL2 context limit exceeded; forcing 2D overflow mode.');
+        this.isOverflow = true;
         this.isFallbackMode = true;
+        this.currentRenderMode = '2d-overflow';
+        this.onFallback?.('overflow');
       }
     }
+
+    if (this.gl) {
+      if (this.hasJSSlot) {
+        WebGLContextPool.releaseJSSlot(this);
+        this.hasJSSlot = false;
+      }
+      this.initWebGL();
+      this.currentRenderMode = 'webgl';
+      return true;
+    } else {
+      if (this.hasGLSlot) {
+        WebGLContextPool.releaseGLSlot(this);
+        this.hasGLSlot = false;
+      }
+      if (!this.isOverflow) {
+        this.logger.warn('WebGL2 unavailable; rendering via 2D canvas.');
+        this.currentRenderMode = '2d-fallback';
+        this.onFallback?.('unavailable');
+      } else {
+        this.currentRenderMode = '2d-overflow';
+      }
+      this.canvas2dCtx = this.canvas.getContext('2d');
+      this.isFallbackMode = true;
+      return false;
+    }
+  }
+
+  public renderYUV(frame: YUVFrameData) {
+    this.tryInitWebGL();
 
     if (this.isFallbackMode || this.canvas2dCtx) {
       if (!this.canvas2dCtx) {
@@ -322,8 +406,25 @@ export class WebGLVideoRenderer {
           this.logger.warn('No 2D context available for YUV rendering; frame dropped.');
           this.lastYuvLogTime = performance.now();
         }
+        this.currentRenderMode = 'js-fallback-dropped';
         return;
       }
+
+      // Check JS per-pixel fallback cell limit
+      if (!this.hasJSSlot) {
+        this.hasJSSlot = WebGLContextPool.acquireJSSlot(this);
+      }
+
+      if (!this.hasJSSlot) {
+        if (performance.now() - this.lastYuvLogTime > 4000) {
+          this.logger.warn('JS per-pixel YUV rendering limit exceeded; frame dropped.');
+          this.lastYuvLogTime = performance.now();
+        }
+        this.currentRenderMode = 'js-fallback-dropped';
+        return;
+      }
+
+      this.currentRenderMode = 'js-fallback';
       const { width, height, yPlane, uPlane, vPlane } = frame;
       
       const now = performance.now();
@@ -373,6 +474,7 @@ export class WebGLVideoRenderer {
       return;
     }
 
+    this.currentRenderMode = 'webgl';
     const gl = this.gl!;
     const { width, height, yPlane, uPlane, vPlane } = frame;
 
@@ -410,13 +512,11 @@ export class WebGLVideoRenderer {
     // Bind buffer and setup attributes
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
 
-    const aPos = gl.getAttribLocation(this.yuvProgram!, 'a_position');
-    gl.enableVertexAttribArray(aPos);
-    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(this.yuvLocations.aPos);
+    gl.vertexAttribPointer(this.yuvLocations.aPos, 2, gl.FLOAT, false, 16, 0);
 
-    const aTex = gl.getAttribLocation(this.yuvProgram!, 'a_texCoord');
-    gl.enableVertexAttribArray(aTex);
-    gl.vertexAttribPointer(aTex, 2, gl.FLOAT, false, 16, 8);
+    gl.enableVertexAttribArray(this.yuvLocations.aTex);
+    gl.vertexAttribPointer(this.yuvLocations.aTex, 2, gl.FLOAT, false, 16, 8);
 
     // Draw
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -428,11 +528,7 @@ export class WebGLVideoRenderer {
     this.renderCount++;
     const isThrottle = this.renderCount % 60 === 1;
 
-    if (!this.gl && !this.canvas2dCtx) {
-      this.canvas2dCtx = this.canvas.getContext('2d');
-      this.isFallbackMode = true;
-      this.logger.debug(`Lazily initialized 2D Canvas context. Success: ${!!this.canvas2dCtx}`);
-    }
+    this.tryInitWebGL();
 
     const width = 'displayWidth' in frame ? frame.displayWidth : frame.width;
     const height = 'displayHeight' in frame ? frame.displayHeight : frame.height;
@@ -444,9 +540,15 @@ export class WebGLVideoRenderer {
     // Maintain aspect ratio, with a minimum display size to prevent microscopic canvas sizing
     let targetWidth = width;
     let targetHeight = height;
-    if (width <= 16 && height <= 16) {
-      targetWidth = 640;
-      targetHeight = 360;
+    const isDegenerate = width <= 16 && height <= 16;
+    if (isDegenerate) {
+      if (this.canvas.width > 0 && this.canvas.height > 0) {
+        targetWidth = this.canvas.width;
+        targetHeight = this.canvas.height;
+      } else {
+        targetWidth = 640;
+        targetHeight = 360;
+      }
     }
 
     if (this.canvas.width !== targetWidth || this.canvas.height !== targetHeight) {
@@ -457,6 +559,7 @@ export class WebGLVideoRenderer {
 
     // If WebGL is active and not lost, upload and render VideoFrame via GPU texture
     if (this.gl && this.rgbaProgram && !this.isFallbackMode) {
+      this.currentRenderMode = 'webgl';
       const gl = this.gl;
       gl.viewport(0, 0, targetWidth, targetHeight);
       gl.clear(gl.COLOR_BUFFER_BIT);
@@ -487,13 +590,11 @@ export class WebGLVideoRenderer {
       // Setup attributes
       gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
       
-      const aPos = gl.getAttribLocation(this.rgbaProgram, 'a_position');
-      gl.enableVertexAttribArray(aPos);
-      gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 16, 0);
+      gl.enableVertexAttribArray(this.rgbaLocations.aPos);
+      gl.vertexAttribPointer(this.rgbaLocations.aPos, 2, gl.FLOAT, false, 16, 0);
 
-      const aTex = gl.getAttribLocation(this.rgbaProgram, 'a_texCoord');
-      gl.enableVertexAttribArray(aTex);
-      gl.vertexAttribPointer(aTex, 2, gl.FLOAT, false, 16, 8);
+      gl.enableVertexAttribArray(this.rgbaLocations.aTex);
+      gl.vertexAttribPointer(this.rgbaLocations.aTex, 2, gl.FLOAT, false, 16, 8);
 
       // Draw quad
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -501,6 +602,7 @@ export class WebGLVideoRenderer {
     }
 
     if (this.canvas2dCtx) {
+      this.currentRenderMode = this.isOverflow ? '2d-overflow' : '2d-fallback';
       try {
         this.canvas2dCtx.drawImage(frame, 0, 0, targetWidth, targetHeight);
       } catch (err) {
@@ -513,6 +615,12 @@ export class WebGLVideoRenderer {
     }
   }
 
+  /**
+   * Render the gap placeholder. Note: the pulse animation is synchronized with
+   * performance.now(), meaning it naturally freezes if the animation frame loop
+   * (requestAnimationFrame) is stalled. This is a deliberate resource-hygiene
+   * design choice to prevent unnecessary CPU/timer wakeups when the stream is not ticking.
+   */
   public drawGapPlaceholder() {
     if (this.placeholderStyle === 'none') {
       return;
@@ -591,6 +699,15 @@ export class WebGLVideoRenderer {
   public destroy() {
     this.canvas.removeEventListener('webglcontextlost', this.handleContextLost);
     this.canvas.removeEventListener('webglcontextrestored', this.handleContextRestored);
+
+    if (this.hasGLSlot) {
+      WebGLContextPool.releaseGLSlot(this);
+      this.hasGLSlot = false;
+    }
+    if (this.hasJSSlot) {
+      WebGLContextPool.releaseJSSlot(this);
+      this.hasJSSlot = false;
+    }
 
     this.cleanupTextures();
     if (this.gl) {

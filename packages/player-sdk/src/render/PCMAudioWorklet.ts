@@ -361,7 +361,9 @@ export class PCMAudioWorklet {
     if (!this.isInitialized) {
       // Not yet initialized — trigger lazy init (will start receiving audio after init)
       this.initialize(this.lastSeenSampleRate).then(() => {
-        this.resume().catch(() => {});
+        this.resume().catch((err) => {
+          this.logger.debug('Failed to resume PCMAudioWorklet during lazy init:', err);
+        });
       }).catch(err => {
         this.logger.error('Lazy initialization in decodeAndFeed failed:', err);
       });

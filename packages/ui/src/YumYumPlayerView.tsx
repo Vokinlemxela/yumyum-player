@@ -42,6 +42,9 @@ export interface PlayerHandle {
     decodedFrames?: number;
     effectiveFps?: number;
   };
+  getQualityLevels?(): { id: string; label: string; url: string; kind: 'main' | 'sub' | 'auto' | string; width?: number; height?: number; fps?: number; bitrateKbps?: number }[];
+  getActiveQuality?(): string;
+  setQuality?(id: string): Promise<void>;
   on(event: string, callback: (...args: unknown[]) => void): void;
   off(event: string, callback: (...args: unknown[]) => void): void;
   unlockAudio?(): Promise<void>;
@@ -86,8 +89,8 @@ export interface YumYumPlayerViewProps {
 const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 4, 16];
 
 const STRINGS = {
-  ru: { speed: 'Скорость', normal: 'Обычная', autoplay: 'Автовоспроизведение', loop: 'Повтор', live: 'В ЭФИРЕ', settings: 'Настройки', on: 'Вкл', off: 'Выкл', noVideo: 'Видео отсутствует' },
-  en: { speed: 'Speed', normal: 'Normal', autoplay: 'Autoplay', loop: 'Loop', live: 'LIVE', settings: 'Settings', on: 'On', off: 'Off', noVideo: 'No video' },
+  ru: { speed: 'Скорость', normal: 'Обычная', autoplay: 'Автовоспроизведение', loop: 'Повтор', live: 'В ЭФИРЕ', settings: 'Настройки', on: 'Вкл', off: 'Выкл', noVideo: 'Видео отсутствует', quality: 'Качество' },
+  en: { speed: 'Speed', normal: 'Normal', autoplay: 'Autoplay', loop: 'Loop', live: 'LIVE', settings: 'Settings', on: 'On', off: 'Off', noVideo: 'No video', quality: 'Quality' },
 };
 
 // Затяжной сталл (тиков по 250мс), после которого вместо крутящегося лоадера
@@ -317,6 +320,8 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
   const [isLive, setIsLive] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
   const [signalLost, setSignalLost] = useState(false);
+  const [qualityLevels, setQualityLevels] = useState<{ id: string; label: string; url: string; kind: string }[]>([]);
+  const [activeQuality, setActiveQuality] = useState<string>('auto');
   const [isReady, setIsReady] = useState(false);
   const [hasError, setHasError] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -339,6 +344,7 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
     let mounted = true;
     let poll: ReturnType<typeof setInterval> | null = null;
     let created: PlayerHandle | null = null;
+    let onQualityChange: ((id: any) => void) | null = null;
     let lastFrames = -1;
     let stallTicks = 0;
 
@@ -365,9 +371,27 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
         player.mute(muted);
         if (rate !== 1) player.setPlaybackRate(rate);
 
+        onQualityChange = (id: any) => {
+          if (mounted) {
+            setActiveQuality(id as string);
+          }
+        };
+
         player.on('ended', onEnded);
         player.on('error', () => { if (mounted) setHasError(true); });
-        if (mounted) setIsReady(true);
+        player.on('waiting', () => { if (mounted) setIsBuffering(true); });
+        player.on('playing', () => { if (mounted) setIsBuffering(false); });
+        player.on('qualitychange', onQualityChange);
+        
+        if (mounted) {
+          setIsReady(true);
+          if (player.getQualityLevels) {
+            setQualityLevels(player.getQualityLevels());
+          }
+          if (player.getActiveQuality) {
+            setActiveQuality(player.getActiveQuality());
+          }
+        }
 
         if (live || autoplay) {
           player.play().then(() => { if (mounted) setIsPlaying(true); }).catch(() => {});
@@ -381,18 +405,14 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
           setBuffered(tel.bufferedEnd);
           const playing = tel.playbackState === 'PLAYING';
           setIsPlaying(playing);
-          // Stall = playing, queue drained, and no new frame since last tick.
-          // Require a few consecutive stalled ticks before showing the spinner
-          // so a brief gap (e.g. right after a seek) doesn't flash it, and clear
-          // it instantly the moment frames start flowing again.
+          // Stall detection for signal lost overlay only.
+          // The buffering spinner itself is driven by the player's edge-triggered
+          // 'waiting' and 'playing' events to avoid false loader flashes.
           const tickStalled = playing && tel.renderedFrames === lastFrames
             && tel.queueLength === 0 && tel.activeCodec !== 'mjpeg';
           stallTicks = tickStalled ? stallTicks + 1 : 0;
-          // Короткий сталл — спиннер (буферизация); затяжной — заглушка
-          // «видео отсутствует» (данных нет: дыра в записи / потерян сигнал).
           const lost = stallTicks >= SIGNAL_LOST_TICKS;
           setSignalLost(lost);
-          setIsBuffering(stallTicks >= 3 && !lost);
           lastFrames = tel.renderedFrames;
 
           // Eagerly mirror the canvas into the off-screen PiP <video> once frames
@@ -425,6 +445,9 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
       if (poll) clearInterval(poll);
       if (created) {
         created.off('ended', onEnded);
+        if (onQualityChange) {
+          created.off('qualitychange', onQualityChange);
+        }
         try { created.destroy(); } catch { /* noop */ }
       }
       playerRef.current = null;
@@ -754,9 +777,15 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
                     rate={rate}
                     autoplay={autoplay}
                     loop={loop}
+                    qualityLevels={qualityLevels}
+                    activeQuality={activeQuality}
                     onRate={applyRate}
                     onAutoplay={(v) => { setAutoplay(v); writeStore(K('autoplay'), v); }}
                     onLoop={(v) => { setLoop(v); writeStore(K('loop'), v); }}
+                    onQuality={(id) => {
+                      setActiveQuality(id);
+                      playerRef.current?.setQuality?.(id);
+                    }}
                   />
                 )}
               </div>
@@ -799,10 +828,13 @@ const SettingsMenu: React.FC<{
   rate: number;
   autoplay: boolean;
   loop: boolean;
+  qualityLevels: { id: string; label: string; url: string; kind: string }[];
+  activeQuality: string;
   onRate: (r: number) => void;
   onAutoplay: (v: boolean) => void;
   onLoop: (v: boolean) => void;
-}> = ({ lang, accent, rate, autoplay, loop, onRate, onAutoplay, onLoop }) => {
+  onQuality: (id: string) => void;
+}> = ({ lang, accent, rate, autoplay, loop, qualityLevels, activeQuality, onRate, onAutoplay, onLoop, onQuality }) => {
   const t = STRINGS[lang];
   const Toggle: React.FC<{ label: string; on: boolean; onClick: () => void }> = ({ label, on, onClick }) => (
     <Button variant="ghost" className="yyv-mi" onClick={onClick}>
@@ -810,10 +842,48 @@ const SettingsMenu: React.FC<{
       <span style={{ fontWeight: 700, fontSize: 10, color: on ? accent : '#888' }}>{on ? t.on : t.off}</span>
     </Button>
   );
+  
+  const hasMultipleLevels = qualityLevels.length > 0;
+
   return (
     <div className="yyv-menu">
       <Toggle label={t.autoplay} on={autoplay} onClick={() => onAutoplay(!autoplay)} />
       <Toggle label={t.loop} on={loop} onClick={() => onLoop(!loop)} />
+      
+      {hasMultipleLevels && (
+        <>
+          <div className="yyv-sep" />
+          <div className="yyv-mlabel">{t.quality}</div>
+          <select
+            value={activeQuality}
+            onChange={(e) => onQuality(e.target.value)}
+            className="yyp-select"
+            style={{
+              width: '100%',
+              margin: '6px 0',
+              padding: '6px',
+              background: '#000',
+              color: '#fff',
+              border: `1px solid ${accent}`,
+              borderRadius: '4px',
+              fontFamily: 'ui-monospace,SF Mono,Menlo,monospace',
+              fontSize: '11px',
+              outline: 'none',
+              cursor: 'pointer'
+            }}
+          >
+            <option value="auto">Auto</option>
+            <option value="main">Main (High)</option>
+            <option value="sub">Sub (Low)</option>
+            {qualityLevels.map((lvl) => (
+              <option key={lvl.id} value={lvl.id}>
+                {lvl.label}
+              </option>
+            ))}
+          </select>
+        </>
+      )}
+
       <div className="yyv-sep" />
       <div className="yyv-mlabel">{t.speed}</div>
       {PLAYBACK_RATES.map((r) => (
