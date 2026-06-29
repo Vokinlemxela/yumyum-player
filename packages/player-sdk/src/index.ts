@@ -116,6 +116,8 @@ export interface PlayerTelemetry {
   maxAllowedKind?: 'main' | 'sub' | null;
   /** Current rendering mode status. */
   renderMode?: string;
+  /** Loader connection state for live stream status. */
+  connectionState?: string;
 }
 
 export type PlayerEvent = 'play' | 'pause' | 'error' | 'ended' | 'waiting' | 'playing' | 'qualitychange' | 'signals' | 'renderfallback';
@@ -845,6 +847,7 @@ export class YumYumPlayer {
       lastSwitchReason: this.qualityController.getDiagnostics().lastSwitchReason,
       maxAllowedKind: this.qualityController.getMaxQualityKind(),
       renderMode: this.videoRenderer.getRenderMode(),
+      connectionState: (this.activeLoader as any)?.getConnectionState?.(),
     };
   }
 

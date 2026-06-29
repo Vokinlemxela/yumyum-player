@@ -41,6 +41,7 @@ export interface PlayerHandle {
     queueLength: number;
     decodedFrames?: number;
     effectiveFps?: number;
+    connectionState?: string;
   };
   getQualityLevels?(): { id: string; label: string; url: string; kind: 'main' | 'sub' | 'auto' | string; width?: number; height?: number; fps?: number; bitrateKbps?: number }[];
   getActiveQuality?(): string;
