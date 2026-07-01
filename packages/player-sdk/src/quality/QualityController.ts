@@ -68,6 +68,23 @@ export class QualityController {
     return this.maxAllowedKind;
   }
 
+  /**
+   * Returns the kind ('main' | 'sub') of the REAL underlying rendition currently
+   * playing, independent of the controller mode. Unlike the player's
+   * `getActiveQuality()` — which collapses to the literal 'auto' whenever mode is
+   * auto — this reflects what is actually on screen even while auto-ABR (or a
+   * density restriction) has pre-empted the active level. Returns `null` when the
+   * active rendition is unknown or carries no kind.
+   */
+  public getActiveRenditionKind(): 'main' | 'sub' | null {
+    const activeId = this.source.getActiveId();
+    const level = this.source.getLevels().find(l => l.id === activeId);
+    if (level?.kind === 'main' || level?.kind === 'sub') {
+      return level.kind;
+    }
+    return null;
+  }
+
   public setMaxQualityKind(kind: 'main' | 'sub' | null): void {
     if (this.maxAllowedKind !== kind) {
       this.logger.info(`ABR density limit restriction changed to: ${kind}`);

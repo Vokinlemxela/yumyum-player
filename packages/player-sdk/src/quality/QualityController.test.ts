@@ -3,6 +3,7 @@ import { QualityController } from './QualityController.js';
 import { QualitySource, QualityLevel } from './QualitySource.js';
 import { StreamSignals } from './Signals.js';
 import { Logger } from '../utils/Logger.js';
+import { shouldEmitQualityChangeOnUnchangedRendition } from '../index.js';
 
 describe('QualityController ABR logic', () => {
   let mockSource: QualitySource;
@@ -240,5 +241,96 @@ describe('QualityController ABR logic', () => {
 
     expect(switchCalls).toContain('level-sub');
     expect(activeId).toBe('level-sub');
+  });
+
+  it('reports the real underlying rendition kind even while in auto mode', () => {
+    activeId = 'level-main';
+    const controller = new QualityController(mockSource, logger, { mode: 'auto' });
+
+    expect(controller.getActiveRenditionKind()).toBe('main');
+
+    // Density restriction pre-empts the active rendition to sub while mode stays 'auto'.
+    controller.setMaxQualityKind('sub');
+    expect(controller.getMode()).toBe('auto');
+    expect(activeId).toBe('level-sub');
+    // getActiveRenditionKind must reflect what is ACTUALLY playing, not 'auto'.
+    expect(controller.getActiveRenditionKind()).toBe('sub');
+  });
+
+  // ─── Regression: swallowed auto→manual transition ─────────────────
+  //
+  // Reproduces the exact production bug: selecting "SUB" appears to do nothing.
+  // 1. On load the app applies setMaxQualityKind('sub') WHILE mode is 'auto',
+  //    which force-switches the active rendition to sub but leaves mode 'auto'.
+  // 2. The user manually clicks "SUB" → setQuality('sub'). The active id already
+  //    equals sub, so the old code early-returned without emitting 'qualitychange'
+  //    — the app's listener never fired and the UI never reconciled from AUTO.
+  //
+  // This test drives the REAL QualityController through the pre-emption, then
+  // replays the player's setQuality('sub') algorithm using the REAL exported
+  // decision helper `shouldEmitQualityChangeOnUnchangedRendition`. It FAILS
+  // before the fix (helper/branch absent → no emit) and PASSES after.
+  it('emits qualitychange when manually selecting sub that ABR already pre-empted (auto→manual)', () => {
+    activeId = 'level-main';
+    const controller = new QualityController(mockSource, logger, { mode: 'auto' });
+
+    // Step 1: density restriction applied in auto mode force-switches to sub.
+    controller.setMaxQualityKind('sub');
+    expect(activeId).toBe('level-sub');
+    expect(controller.getMode()).toBe('auto'); // mode NOT collapsed by the restriction
+
+    // Step 2: user manually selects "sub" — replay the player's setQuality algorithm.
+    const emitted: Array<{ event: string; id: string }> = [];
+    const emit = (event: string, id: string) => emitted.push({ event, id });
+
+    const modeChanged = controller.getMode() !== 'manual';
+    controller.setMode('manual');
+
+    // Resolve alias 'sub' → concrete level id (as the player does).
+    const resolvedId = mockLevels.find(l => l.kind === 'sub')!.id;
+    const currentActiveId = mockSource.getActiveId();
+    const renditionChanged = currentActiveId !== resolvedId;
+
+    if (renditionChanged) {
+      mockSource.switchQuality(resolvedId);
+      emit('qualitychange', resolvedId);
+    } else if (shouldEmitQualityChangeOnUnchangedRendition(renditionChanged, modeChanged)) {
+      emit('qualitychange', resolvedId);
+    }
+
+    // The transition MUST be observable and the mode MUST become manual.
+    expect(controller.getMode()).toBe('manual');
+    expect(emitted).toEqual([{ event: 'qualitychange', id: 'level-sub' }]);
+  });
+
+  it('does NOT emit a spurious qualitychange on a genuine no-op manual re-select', () => {
+    activeId = 'level-sub';
+    const controller = new QualityController(mockSource, logger, { mode: 'manual' });
+
+    const emitted: string[] = [];
+    const modeChanged = controller.getMode() !== 'manual'; // false — already manual
+    controller.setMode('manual');
+
+    const resolvedId = mockLevels.find(l => l.kind === 'sub')!.id;
+    const renditionChanged = mockSource.getActiveId() !== resolvedId; // false
+
+    if (renditionChanged) {
+      mockSource.switchQuality(resolvedId);
+      emitted.push(resolvedId);
+    } else if (shouldEmitQualityChangeOnUnchangedRendition(renditionChanged, modeChanged)) {
+      emitted.push(resolvedId);
+    }
+
+    expect(emitted).toEqual([]); // no spurious event, no double-emit
+  });
+
+  it('shouldEmitQualityChangeOnUnchangedRendition: truth table', () => {
+    // rendition changed → switch path emits, helper stays out of it
+    expect(shouldEmitQualityChangeOnUnchangedRendition(true, true)).toBe(false);
+    expect(shouldEmitQualityChangeOnUnchangedRendition(true, false)).toBe(false);
+    // rendition unchanged + mode changed (auto→manual) → emit
+    expect(shouldEmitQualityChangeOnUnchangedRendition(false, true)).toBe(true);
+    // rendition unchanged + mode unchanged → silent
+    expect(shouldEmitQualityChangeOnUnchangedRendition(false, false)).toBe(false);
   });
 });

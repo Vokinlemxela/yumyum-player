@@ -53,6 +53,39 @@ export function shouldDecodeFrame(playbackRate: number, isKeyframe: boolean): bo
   return true;
 }
 
+// ─── Manual Quality Selection Gate ──────────────────────────────────
+
+/**
+ * Decides whether a manual `setQuality()` call must emit a `qualitychange`
+ * event even though the underlying rendition id is unchanged.
+ *
+ * The problem this guards against: while the controller is in auto-ABR mode a
+ * density restriction (`setMaxQualityKind('sub')`) can already force the active
+ * rendition down to the sub level. A later manual `setQuality('sub')` then finds
+ * the active id already equals the resolved id and, historically, early-returned
+ * without emitting — swallowing the auto→manual transition so the UI stayed on
+ * "AUTO" while sub was actually playing.
+ *
+ * Rule:
+ *  - rendition actually changes → caller performs switchQuality + emit (handled
+ *    on the switch path, not here).
+ *  - rendition unchanged BUT the mode transitioned (e.g. auto→manual) → still
+ *    emit so consumers reconcile.
+ *  - rendition unchanged AND mode unchanged (a genuine no-op re-select of the
+ *    same manual level) → stay silent, no spurious event.
+ *
+ * @param renditionChanged - Whether the resolved target differs from the active id.
+ * @param modeChanged      - Whether this call changed the controller mode.
+ * @returns `true` if a `qualitychange` event should be emitted on the unchanged-rendition path.
+ */
+export function shouldEmitQualityChangeOnUnchangedRendition(
+  renditionChanged: boolean,
+  modeChanged: boolean
+): boolean {
+  if (renditionChanged) return false; // switch path handles its own emit
+  return modeChanged;
+}
+
 // ─── Public API Types ───────────────────────────────────────────────
 
 export interface PlayerConfig {
@@ -629,6 +662,9 @@ export class YumYumPlayer {
       return;
     }
 
+    // Capture the mode *before* switching to manual so we can tell whether this
+    // call actually transitions the controller out of auto-ABR.
+    const modeChanged = this.qualityController.getMode() !== 'manual';
     this.qualityController.setMode('manual');
 
     if (this.activeLoader?.quality) {
@@ -640,13 +676,37 @@ export class YumYumPlayer {
           resolvedId = matchingLevel.id;
         }
       }
-      
+
       const activeId = this.activeLoader.quality.getActiveId();
-      if (activeId === resolvedId) return;
-      
+      if (activeId === resolvedId) {
+        // The active rendition already matches the requested level. This happens
+        // when an auto-ABR restriction (e.g. setMaxQualityKind('sub')) already
+        // force-switched the underlying rendition while mode was 'auto'. Skipping
+        // the emit would swallow the auto→manual transition and leave the UI
+        // showing "AUTO" while sub is playing. Emit so consumers reconcile — but
+        // only when the mode actually changed, so a genuine no-op manual re-select
+        // of the same level stays silent (no spurious event).
+        if (shouldEmitQualityChangeOnUnchangedRendition(false, modeChanged)) {
+          this.emit('qualitychange', resolvedId);
+        }
+        return;
+      }
+
       await this.activeLoader.quality.switchQuality(resolvedId);
       this.emit('qualitychange', resolvedId);
     }
+  }
+
+  /**
+   * Get the kind ('main' | 'sub') of the REAL underlying rendition currently
+   * playing, regardless of mode. `getActiveQuality()` returns the literal
+   * 'auto' while ABR is engaged, which hides the fact that a density restriction
+   * may have pre-empted the active level to sub. HUDs/overlays that need to show
+   * what is actually on screen should use this accessor. Returns `null` when
+   * unknown or the rendition has no kind.
+   */
+  public getActiveRenditionKind(): 'main' | 'sub' | null {
+    return this.qualityController.getActiveRenditionKind();
   }
 
   /** Get current ABR quality controller mode */
