@@ -262,10 +262,6 @@ export class WebGLVideoRenderer {
   }
 
   private fallbackTo2D() {
-    if (this.hasGLSlot) {
-      WebGLContextPool.releaseGLSlot(this);
-      this.hasGLSlot = false;
-    }
     this.gl = null;
     this.canvas2dCtx = this.canvas.getContext('2d');
     this.isFallbackMode = true;
