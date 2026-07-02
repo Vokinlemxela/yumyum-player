@@ -86,6 +86,50 @@ export function shouldEmitQualityChangeOnUnchangedRendition(
   return modeChanged;
 }
 
+/**
+ * Clamps a resolved quality level id against the `maxQualityKind` density
+ * ceiling (see `setMaxQualityKind()`). The ceiling is a HARD CEILING enforced
+ * in both auto and manual mode: a manual `setQuality()` must not be able to
+ * select a rendition whose kind exceeds it.
+ *
+ * 'main' and 'sub' are the only two kinds and 'main' is always the higher
+ * one, so "exceeds the ceiling" only ever means `maxAllowedKind === 'sub'`
+ * while the target level's kind is `'main'`. When that happens, this returns
+ * the id of the highest-bitrate level whose kind conforms (kind === ceiling,
+ * or no kind at all) instead — mirroring the selection strategy
+ * `QualityController.evaluateRestriction()` uses internally, so manual
+ * selection and auto-ABR density enforcement land on the same target.
+ *
+ * When `maxAllowedKind` is `null`, or the target already conforms, `targetId`
+ * is returned unchanged (no clamping) — this is the current/default behavior.
+ *
+ * @param levels - The full set of available quality levels for the active stream.
+ * @param targetId - The already-resolved (alias-free) requested level id.
+ * @param maxAllowedKind - The current density ceiling, or `null` if unrestricted.
+ * @returns The id to actually switch to — either `targetId` or the clamped id.
+ */
+export function clampToMaxQualityKind(
+  levels: QualityLevel[],
+  targetId: string,
+  maxAllowedKind: 'main' | 'sub' | null
+): string {
+  if (!maxAllowedKind) {
+    return targetId;
+  }
+
+  const targetLevel = levels.find(l => l.id === targetId);
+  const exceedsCeiling = maxAllowedKind === 'sub' && targetLevel?.kind === 'main';
+  if (!exceedsCeiling) {
+    return targetId;
+  }
+
+  const conformingLevels = levels
+    .filter(l => l.id !== 'auto')
+    .sort((a, b) => (b.bitrateKbps || 0) - (a.bitrateKbps || 0));
+  const conformingLevel = conformingLevels.find(l => l.kind === maxAllowedKind || !l.kind);
+  return conformingLevel ? conformingLevel.id : targetId;
+}
+
 // ─── Public API Types ───────────────────────────────────────────────
 
 export interface PlayerConfig {
@@ -194,6 +238,15 @@ export class YumYumPlayer {
   private userMuted = false;
 
   private lifecycleState: PlayerLifecycleState = 'IDLE';
+  /**
+   * Monotonic generation counter guarding `load()` against torn-down state.
+   * Bumped at the start of every `load()` call and by `destroy()`. A `load()`
+   * continuation compares its captured epoch against the current value after
+   * every `await`: a mismatch means a newer `load()` or a `destroy()` call
+   * superseded it while it was suspended, so it must bail out without
+   * mutating shared state (lifecycle, playback, or emitting events).
+   */
+  private loadEpoch = 0;
   private lastError: Error | null = null;
   private audioUnlockCleanup: (() => void) | null = null;
   private lastSignals: StreamSignals | null = null;
@@ -477,6 +530,11 @@ export class YumYumPlayer {
       throw new Error('YumYumPlayer: Cannot load. Player is in DESTROYED state.');
     }
 
+    // Capture this call's generation. Any `await` below must re-check it
+    // against `this.loadEpoch` before mutating shared state — a mismatch
+    // means a newer load() or a destroy() ran while we were suspended.
+    const epoch = ++this.loadEpoch;
+
     this.logger.info(`Loading stream from: ${url} (Current state: ${this.lifecycleState})`);
     this.lifecycleState = 'LOADING';
     this.lastError = null;
@@ -527,6 +585,22 @@ export class YumYumPlayer {
       // 5. Connect / load the source
       await loader.load(url);
 
+      if (epoch !== this.loadEpoch || this.state === 'DESTROYED') {
+        // A newer load() or a destroy() superseded this call while we were
+        // awaiting. Clean up the loader THIS call created, but only if it's
+        // still the active one — destroy() and any newer load() already
+        // tear down / replace `this.activeLoader` on their own paths, so
+        // touching it here would risk a double-destroy or clobbering a
+        // newer loader. Do not mutate lifecycleState, start playback, or
+        // emit — the superseding call owns all of that now.
+        if (this.activeLoader === loader) {
+          loader.stop();
+          loader.destroy();
+          this.activeLoader = null;
+        }
+        return;
+      }
+
       if (loader.kind === 'push') {
         // Live stream: already streaming on connect — start playback immediately
         this.playbackController.duration = Infinity;
@@ -543,8 +617,15 @@ export class YumYumPlayer {
       this.lifecycleState = 'LOADED';
     } catch (err) {
       this.logger.error('Failed to load stream:', err);
-      this.lifecycleState = 'IDLE';
-      this.terminateDemuxWorker();
+      if (epoch === this.loadEpoch && this.state !== 'DESTROYED') {
+        // Only touch shared state if we're still the current generation — a
+        // newer load() or a destroy() already moved lifecycleState on (and,
+        // for the worker, may already be relying on the reused instance), so
+        // stomping over it here would resurrect/corrupt that state or rip
+        // the demux worker out from under the call that superseded us.
+        this.lifecycleState = 'IDLE';
+        this.terminateDemuxWorker();
+      }
       throw err;
     }
   }
@@ -579,8 +660,12 @@ export class YumYumPlayer {
             return;
           }
 
-          if (this.lifecycleState === 'PAUSED') {
-            // Discard frames when paused to stop decoding CPU/GPU load
+          if (this.lifecycleState !== 'PLAYING') {
+            // Discard frames unless actively playing: stops decoding CPU/GPU
+            // load while paused, and drops stale frames that arrive in
+            // LOADING/LOADED/IDLE/DESTROYED (e.g. late frames from a previous
+            // stream after a codec change with worker reuse) instead of
+            // decoding them into a stale-frame flash / leaked VideoFrame.
             return;
           }
 
@@ -668,14 +753,22 @@ export class YumYumPlayer {
     this.qualityController.setMode('manual');
 
     if (this.activeLoader?.quality) {
+      const levels = this.activeLoader.quality.getLevels();
       let resolvedId = id;
       if (id === 'main' || id === 'sub') {
-        const levels = this.activeLoader.quality.getLevels();
         const matchingLevel = levels.find(l => l.kind === id);
         if (matchingLevel) {
           resolvedId = matchingLevel.id;
         }
       }
+
+      // Hard ceiling enforcement: setMaxQualityKind() is a density constraint
+      // (e.g. grid layouts capping cells to 'sub') that applies in BOTH auto
+      // and manual mode. A manual selection must not be able to pick a
+      // rendition whose kind exceeds the ceiling — clamp down to the highest
+      // conforming level instead. When there is no ceiling, resolvedId is
+      // left untouched (current behavior, no clamping).
+      resolvedId = clampToMaxQualityKind(levels, resolvedId, this.qualityController.getMaxQualityKind());
 
       const activeId = this.activeLoader.quality.getActiveId();
       if (activeId === resolvedId) {
@@ -910,7 +1003,7 @@ export class YumYumPlayer {
       lastSwitchReason: this.qualityController.getDiagnostics().lastSwitchReason,
       maxAllowedKind: this.qualityController.getMaxQualityKind(),
       renderMode: this.videoRenderer.getRenderMode(),
-      connectionState: (this.activeLoader as any)?.getConnectionState?.(),
+      connectionState: this.activeLoader?.getConnectionState?.(),
     };
   }
 
@@ -1011,6 +1104,10 @@ export class YumYumPlayer {
     if (this.lifecycleState === 'DESTROYED') {
       return;
     }
+
+    // Bump the load epoch so any in-flight load() sees it superseded on its
+    // next post-await check and bails out instead of resurrecting state.
+    this.loadEpoch++;
 
     this.logger.info(`Destroying player (Current state: ${this.lifecycleState})`);
     this.pause();

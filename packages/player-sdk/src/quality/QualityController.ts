@@ -91,11 +91,13 @@ export class QualityController {
       this.maxAllowedKind = kind;
       this.downDwellStartTime = null;
       this.upDwellStartTime = null;
-      
-      // If we are in auto mode, apply the restriction immediately
-      if (this.mode === 'auto') {
-        this.evaluateRestriction();
-      }
+
+      // Apply the restriction immediately regardless of mode. This is a hard
+      // ceiling (e.g. grid density limiting) and must be enforced in manual
+      // mode too — clearing/raising the ceiling is a no-op here since
+      // evaluateRestriction() only ever forces a DOWN-switch when the active
+      // level violates the (new, non-null) restriction.
+      this.evaluateRestriction();
     }
   }
 
@@ -219,6 +221,13 @@ export class QualityController {
   /**
    * Forces a down-switch if the active level violates the density limit restriction.
    * Returns true if a switch was performed or is pending (cooldown active).
+   *
+   * Only ever forces DOWN: a violation means the active kind exceeds the
+   * ceiling ('main' while maxAllowedKind is 'sub'). Since 'main'/'sub' is the
+   * only ordering, that is equivalent to `maxAllowedKind === 'sub' && currentLevel.kind === 'main'`.
+   * This must NOT trigger merely because the active kind differs from the
+   * ceiling — e.g. raising the ceiling from 'sub' to 'main' while 'sub' is
+   * active must leave the current manual selection alone (no forced up-switch).
    */
   private evaluateRestriction(): boolean {
     if (!this.maxAllowedKind) return false;
@@ -229,7 +238,8 @@ export class QualityController {
     if (activeIndex === -1) return false;
 
     const currentLevel = levels[activeIndex];
-    if (currentLevel.kind && currentLevel.kind !== this.maxAllowedKind) {
+    const exceedsCeiling = this.maxAllowedKind === 'sub' && currentLevel.kind === 'main';
+    if (exceedsCeiling) {
       // Find the highest available quality level that conforms to the restriction
       const conformingLevel = levels.find(l => l.kind === this.maxAllowedKind || !l.kind);
       if (conformingLevel && conformingLevel.id !== activeId) {

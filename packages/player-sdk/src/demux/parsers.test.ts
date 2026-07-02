@@ -205,6 +205,38 @@ describe('parseTRUN', () => {
   it('returns empty for a truncated box', () => {
     expect(parseTRUN(u8(0, 0, 0))).toEqual([]);
   });
+
+  it('bounds a hostile sample_count instead of hanging (DoS guard)', () => {
+    // flags=0: no per-sample fields present, so entrySize is 0 and the only
+    // guard is the sample_count cap itself. sample_count = 0x7FFFFFFF is the
+    // max positive value the `<< 24` read can produce (a real-world attack
+    // would also try the sign-flipped 0x80000000+ range, which the `>>> 0`
+    // unsigned read normalizes to the same over-the-cap territory).
+    const trun = u8(
+      0, 0x00, 0x00, 0x00, // version + flags = 0
+      0x7f, 0xff, 0xff, 0xff, // sample_count = 0x7FFFFFFF
+    );
+    const result = parseTRUN(trun);
+    expect(Array.isArray(result)).toBe(true);
+    expect(result.length).toBeLessThanOrEqual(100_000);
+  });
+
+  it('still parses a normal multi-sample trun after the bounds fix', () => {
+    // flags 0x000301: data_offset + sample_duration + sample_size, 3 samples.
+    const trun = u8(
+      0, 0x00, 0x03, 0x01, // version + flags
+      0, 0, 0, 3,          // sample_count
+      0, 0, 0, 0,          // data_offset
+      0, 0, 0, 10, 0, 0, 0, 100, // sample 1: duration=10, size=100
+      0, 0, 0, 20, 0, 0, 0, 200, // sample 2: duration=20, size=200
+      0, 0, 0, 30, 0, 0, 1, 44, // sample 3: duration=30, size=300 (0x12C, big-endian)
+    );
+    expect(parseTRUN(trun)).toEqual([
+      { size: 100, isKeyframe: true, duration: 10, compositionOffset: 0 },
+      { size: 200, isKeyframe: true, duration: 20, compositionOffset: 0 },
+      { size: 300, isKeyframe: true, duration: 30, compositionOffset: 0 },
+    ]);
+  });
 });
 
 describe('parseTfhd', () => {

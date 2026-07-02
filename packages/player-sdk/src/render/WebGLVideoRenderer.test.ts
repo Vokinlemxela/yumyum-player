@@ -212,6 +212,66 @@ describe('WebGLVideoRenderer & WebGLContextPool', () => {
     expect(WebGLContextPool.getJSCount()).toBe(0);
   });
 
+  it('re-allocates YUV textures after context restore even when frame size is unchanged (RES-H1)', () => {
+    const renderer = new WebGLVideoRenderer(mockCanvas, 'black', logger);
+
+    const frame: YUVFrameData = {
+      width: 320,
+      height: 180,
+      yPlane: new Uint8Array(320 * 180),
+      uPlane: new Uint8Array(160 * 90),
+      vPlane: new Uint8Array(160 * 90),
+    };
+
+    // First frame: initializes WebGL and allocates the Y/U/V textures.
+    renderer.renderYUV(frame);
+    expect(mockGL.createTexture).toHaveBeenCalledTimes(3);
+    expect(mockGL.texStorage2D).toHaveBeenCalledTimes(3);
+
+    // Simulate the browser firing 'webglcontextlost' then 'webglcontextrestored'
+    // by invoking the handlers the renderer registered via addEventListener.
+    const lostHandler = mockCanvas.addEventListener.mock.calls.find(
+      (call: unknown[]) => call[0] === 'webglcontextlost'
+    )?.[1];
+    const restoredHandler = mockCanvas.addEventListener.mock.calls.find(
+      (call: unknown[]) => call[0] === 'webglcontextrestored'
+    )?.[1];
+    expect(lostHandler).toBeTypeOf('function');
+    expect(restoredHandler).toBeTypeOf('function');
+
+    lostHandler({ preventDefault: vi.fn() });
+    expect(WebGLContextPool.getGLCount()).toBe(0);
+
+    restoredHandler();
+    expect(WebGLContextPool.getGLCount()).toBe(1);
+
+    // The bug (RES-H1): lastWidth/lastHeight must be reset on restore, otherwise
+    // a same-dimension frame skips allocateTextures and binds the null textures
+    // left behind by handleContextRestored, rendering blank.
+    expect((renderer as any).lastWidth).toBe(0);
+    expect((renderer as any).lastHeight).toBe(0);
+    expect((renderer as any).yTexture).toBeNull();
+
+    mockGL.createTexture.mockClear();
+    mockGL.texStorage2D.mockClear();
+    mockGL.bindTexture.mockClear();
+
+    // Same dimensions as the first frame — this must still re-allocate textures
+    // because the underlying GL context (and its texture objects) was lost.
+    renderer.renderYUV(frame);
+
+    expect(mockGL.createTexture).toHaveBeenCalledTimes(3);
+    expect(mockGL.texStorage2D).toHaveBeenCalledTimes(3);
+    expect((renderer as any).yTexture).not.toBeNull();
+    expect((renderer as any).uTexture).not.toBeNull();
+    expect((renderer as any).vTexture).not.toBeNull();
+    // Never bind a null texture handle for the Y plane after restore.
+    expect(mockGL.bindTexture).not.toHaveBeenCalledWith(expect.anything(), null);
+    expect(renderer.getRenderMode()).toBe('webgl');
+
+    renderer.destroy();
+  });
+
   it('prevents visual resize flash for degenerate microscopic initial frames', () => {
     const renderer = new WebGLVideoRenderer(mockCanvas, 'black', logger);
 

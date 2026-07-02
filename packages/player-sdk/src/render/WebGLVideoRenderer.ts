@@ -112,6 +112,8 @@ export class WebGLVideoRenderer {
       this.uTexture = null;
       this.vTexture = null;
       this.rgbaTexture = null;
+      this.lastWidth = 0;
+      this.lastHeight = 0;
       this.lastRgbaWidth = 0;
       this.lastRgbaHeight = 0;
     } else {

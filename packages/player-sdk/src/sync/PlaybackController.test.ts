@@ -636,6 +636,204 @@ describe('PlaybackController playback rate', () => {
   });
 });
 
+describe('PlaybackController keyframe-aware dropping and live backpressure', () => {
+  it('snaps the live catch-up drop boundary forward to the nearest keyframe, preserving GOP continuity', () => {
+    let renderedData: any = null;
+    const c = new PlaybackController(
+      null,
+      (data) => { renderedData = data; },
+      null,
+      null,
+      null,
+      25, // targetFps = 25
+      25, // renderFps = 25
+      undefined,
+      new Logger('test', 'silent')
+    );
+    c.duration = Infinity; // Live
+    c.start();
+
+    // Alignment
+    c.enqueueFrame({ pts: 0.0, duration: 0.04, data: { close: vi.fn() } as any });
+    (c as any).tick();
+
+    // Same burst as the plain catch-up test: catchupThreshold = 150, catchupTarget = 62,
+    // so the naive cut (without keyframe awareness) would be dropCount = 160 - 62 = 98,
+    // landing the surviving head on frame i=99 (a delta frame here). Tag i=101 (queue
+    // index 100, two frames past the naive cut) as the GOP's keyframe — the boundary
+    // must snap forward to it so decode continuity is preserved.
+    const KEYFRAME_I = 101;
+    const closeSpies: any[] = [];
+    const keyframeData = { close: vi.fn(), marker: KEYFRAME_I };
+    for (let i = 1; i <= 160; i++) {
+      if (i === KEYFRAME_I) {
+        c.enqueueFrame({ pts: i * 0.04, duration: 0.04, data: keyframeData as any, isKeyframe: true });
+        closeSpies.push(keyframeData.close);
+      } else {
+        const closeSpy = vi.fn();
+        c.enqueueFrame({ pts: i * 0.04, duration: 0.04, data: { close: closeSpy } as any });
+        closeSpies.push(closeSpy);
+      }
+    }
+
+    expect((c as any).frameQueue.length).toBe(160);
+
+    (c as any).tick();
+
+    // The boundary snapped from the naive 98 to 100 (queue index of the keyframe),
+    // dropping 100 frames (i = 1..100) instead of 98.
+    expect((c as any).droppedFramesCount).toBe(100);
+    for (let i = 0; i < 100; i++) {
+      expect(closeSpies[i]).toHaveBeenCalledTimes(1);
+    }
+
+    // The keyframe (i=101, dropped-index 100) was NOT among the dropped/closed
+    // frames from the catch-up splice — it survived as the new head and was
+    // immediately rendered (drift correction re-anchors the clock to it, so
+    // this tick's scheduling loop consumes it as the best frame).
+    expect(renderedData).toBe(keyframeData);
+    expect(renderedData.marker).toBe(KEYFRAME_I);
+    expect(keyframeData.close).toHaveBeenCalledTimes(1); // closed after render, not as a drop
+
+    // Frames after the keyframe were untouched by this tick.
+    for (let i = 101; i < 160; i++) {
+      expect(closeSpies[i]).not.toHaveBeenCalled();
+    }
+  });
+
+  it('falls back to the naive cut when no keyframe exists at or after the boundary (no GOP info available)', () => {
+    // Mirrors the plain catch-up test but documents the fallback explicitly:
+    // when none of the surviving frames are tagged as keyframes, the snap loop
+    // finds nothing and dropCount is left at the naive cut rather than
+    // degrading to "drop everything looking for a keyframe that isn't there".
+    const c = new PlaybackController(
+      null,
+      () => {},
+      null,
+      null,
+      null,
+      25,
+      25,
+      undefined,
+      new Logger('test', 'silent')
+    );
+    c.duration = Infinity;
+    c.start();
+
+    c.enqueueFrame({ pts: 0.0, duration: 0.04, data: { close: vi.fn() } as any });
+    (c as any).tick();
+
+    for (let i = 1; i <= 160; i++) {
+      c.enqueueFrame({ pts: i * 0.04, duration: 0.04, data: { close: vi.fn() } as any });
+    }
+
+    (c as any).tick();
+
+    expect((c as any).droppedFramesCount).toBe(98); // unchanged naive cut
+    expect((c as any).frameQueue.length).toBe(61);
+  });
+
+  describe('live producer backpressure', () => {
+    const makeLiveBackpressureController = (fps: number | undefined = undefined) => {
+      const events: boolean[] = [];
+      const c = new PlaybackController(
+        null,
+        null,
+        (pause) => { events.push(pause); },
+        null,
+        null,
+        fps,
+        fps,
+        undefined,
+        new Logger('test', 'silent')
+      );
+      c.duration = Infinity; // Live — no explicit fps → default 25 in the watermark formula
+      return { c, events };
+    };
+
+    it('pauses decoding when the live queue exceeds the high-water mark', () => {
+      const { c, events } = makeLiveBackpressureController();
+
+      // High-water mark = max(150, fps(25) * CATCHUP_THRESHOLD_MULT(6)) = 150.
+      // Enqueue one past it — enqueueFrame calls checkBackpressure() after
+      // every insert, so backpressure must engage without needing a tick().
+      for (let i = 0; i < 151; i++) {
+        c.enqueueFrame({ pts: i * 0.04, duration: 0.04, data: { close: vi.fn() } as any });
+      }
+
+      expect((c as any).isBackpressurePaused).toBe(true);
+      expect(events).toEqual([true]);
+    });
+
+    it('does not engage backpressure below the high-water mark', () => {
+      const { c, events } = makeLiveBackpressureController();
+
+      for (let i = 0; i < 150; i++) {
+        c.enqueueFrame({ pts: i * 0.04, duration: 0.04, data: { close: vi.fn() } as any });
+      }
+
+      expect((c as any).isBackpressurePaused).toBe(false);
+      expect(events).toEqual([]);
+    });
+
+    it('resumes decoding once the live queue drains below the low-water mark', () => {
+      const { c, events } = makeLiveBackpressureController();
+
+      for (let i = 0; i < 151; i++) {
+        c.enqueueFrame({ pts: i * 0.04, duration: 0.04, data: { close: vi.fn() } as any });
+      }
+      expect((c as any).isBackpressurePaused).toBe(true);
+
+      // Low-water mark = max(60, floor(fps(25) * CATCHUP_TARGET_MULT(2.5))) = 62.
+      // Drain the queue directly (simulating consumption) down to the mark and
+      // re-run the same check tick() would perform.
+      (c as any).frameQueue.length = 62;
+      (c as any).checkBackpressure();
+
+      expect((c as any).isBackpressurePaused).toBe(false);
+      expect(events).toEqual([true, false]);
+    });
+
+    it('does not resume while still above the low-water mark', () => {
+      const { c, events } = makeLiveBackpressureController();
+
+      for (let i = 0; i < 151; i++) {
+        c.enqueueFrame({ pts: i * 0.04, duration: 0.04, data: { close: vi.fn() } as any });
+      }
+      expect((c as any).isBackpressurePaused).toBe(true);
+
+      (c as any).frameQueue.length = 100; // still above the low-water mark (62)
+      (c as any).checkBackpressure();
+
+      expect((c as any).isBackpressurePaused).toBe(true);
+      expect(events).toEqual([true]); // no second (false) event yet
+    });
+
+    it('keeps VOD backpressure thresholds (maxQueueSize/minQueueSize) unaffected by the live watermark logic', () => {
+      const events: boolean[] = [];
+      const c = new PlaybackController(
+        null,
+        null,
+        (pause) => { events.push(pause); },
+        null,
+        null,
+        undefined,
+        undefined,
+        undefined,
+        new Logger('test', 'silent')
+      );
+      c.duration = 60; // VOD — default maxQueueSize = 30, well below the live high-water mark (150)
+
+      for (let i = 0; i < 30; i++) {
+        c.enqueueFrame({ pts: i * 0.04, duration: 0.04, data: { close: vi.fn() } as any });
+      }
+
+      // VOD threshold (30) triggers pause long before the live threshold (150) would.
+      expect((c as any).isBackpressurePaused).toBe(true);
+      expect(events).toEqual([true]);
+    });
+  });
+});
 
 describe('PlaybackController signals interval', () => {
   it('fires onSignals callback at 1 Hz with headroom data', async () => {

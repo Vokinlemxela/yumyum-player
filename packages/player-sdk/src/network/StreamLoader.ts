@@ -77,6 +77,17 @@ export class StreamLoader implements IStreamLoader, QualitySource {
   private throughputSamplesCount = 0;
   private alpha = 0.15;
 
+  /**
+   * Re-entrancy guard for {@link switchQuality}. Without it, an auto-ABR switch
+   * racing a manual switch can interleave mutations of `activeQualityId` /
+   * `playlistUrl` and both call `loadPlaylist` (which resets `segments` /
+   * `fetchIndex` / etc.) on the same instance state, corrupting the playlist.
+   * A concurrent call while one is already in flight is dropped — auto-ABR is
+   * cooldown-gated so losing one cycle is fine, and manual switches retry via
+   * user action.
+   */
+  private isSwitching = false;
+
   private getAbortSignal(): AbortSignal {
     if (!this.activeAbortController) {
       this.activeAbortController = new AbortController();
@@ -103,6 +114,39 @@ export class StreamLoader implements IStreamLoader, QualitySource {
     this.onMockPacket = deps.onMockPacket;
     this.onError = deps.onError;
     this.logger = deps.logger;
+  }
+
+  /**
+   * Resolve a playlist-referenced URL (variant, segment, or EXT-X-MAP URI)
+   * against the playlist's base URL using the URL API instead of naive string
+   * concatenation/`startsWith('http')` checks. `new URL(candidate, baseUrl)`
+   * correctly handles relative paths, root-absolute paths (`/seg.ts`), `../`,
+   * and already-absolute URLs alike — the string-concat approach breaks on the
+   * first two and blindly trusts the third.
+   *
+   * Only `http:`/`https:` resolved schemes are accepted: a malicious playlist
+   * could otherwise point a segment/variant/init URI at `file:`, `javascript:`,
+   * or any other scheme and have the player `fetch()` it. Invalid URLs (parse
+   * failure) or disallowed schemes return `null` and log a warning; callers
+   * must skip/reject that entry.
+   *
+   * Not used for `mock://` playlist/segment URLs — those never reach real HTTP
+   * resolution (see `generateMockPlaylist`, `isMockPlaylist`) and are left
+   * untouched by this hardening.
+   */
+  private resolvePlaylistUrl(candidate: string, baseUrl: string): string | null {
+    let resolved: URL;
+    try {
+      resolved = new URL(candidate, baseUrl);
+    } catch {
+      this.logger.warn(`Skipping unresolvable playlist URL: "${candidate}" (base: "${baseUrl}")`);
+      return null;
+    }
+    if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') {
+      this.logger.warn(`Rejecting playlist URL with disallowed scheme "${resolved.protocol}": ${resolved.href}`);
+      return null;
+    }
+    return resolved.href;
   }
 
   /**
@@ -270,17 +314,19 @@ export class StreamLoader implements IStreamLoader, QualitySource {
             }
             
             if (streamUrl) {
-              const resolvedUrl = streamUrl.startsWith('http') ? streamUrl : baseUrl + streamUrl;
-              parsedLevels.push({
-                id: resolvedUrl,
-                label: height ? `${height}p` : `${(bandwidth ? Math.round(bandwidth / 1000) : 0)}kbps`,
-                url: resolvedUrl,
-                kind: height ? (height <= 480 ? 'sub' : 'main') : 'main',
-                width,
-                height,
-                bitrateKbps: bandwidth ? Math.round(bandwidth / 1000) : undefined,
-                codecs
-              });
+              const resolvedUrl = this.resolvePlaylistUrl(streamUrl, baseUrl);
+              if (resolvedUrl) {
+                parsedLevels.push({
+                  id: resolvedUrl,
+                  label: height ? `${height}p` : `${(bandwidth ? Math.round(bandwidth / 1000) : 0)}kbps`,
+                  url: resolvedUrl,
+                  kind: height ? (height <= 480 ? 'sub' : 'main') : 'main',
+                  width,
+                  height,
+                  bitrateKbps: bandwidth ? Math.round(bandwidth / 1000) : undefined,
+                  codecs
+                });
+              }
             }
           }
         }
@@ -381,17 +427,22 @@ export class StreamLoader implements IStreamLoader, QualitySource {
         const match = /URI="([^"]+)"/.exec(line);
         if (match) {
           const initUrl = match[1];
-          this.initSegmentUrl = initUrl.startsWith('http') ? initUrl : baseUrl + initUrl;
+          const resolvedInitUrl = this.resolvePlaylistUrl(initUrl, baseUrl);
+          // Leave initSegmentUrl empty on rejection — loadPlaylist only fetches
+          // it when non-empty, so a hostile/invalid URI is silently skipped.
+          this.initSegmentUrl = resolvedInitUrl ?? '';
         }
       } else if (line && !line.startsWith('#')) {
         // Resolve absolute or relative segment URL
-        const segmentUrl = line.startsWith('http') ? line : baseUrl + line;
-        newSegments.push({
-          url: segmentUrl,
-          duration: currentDuration,
-          programDateTime: pendingPDT,
-          discontinuity: pendingDiscontinuity,
-        });
+        const segmentUrl = this.resolvePlaylistUrl(line, baseUrl);
+        if (segmentUrl) {
+          newSegments.push({
+            url: segmentUrl,
+            duration: currentDuration,
+            programDateTime: pendingPDT,
+            discontinuity: pendingDiscontinuity,
+          });
+        }
         pendingPDT = undefined;
         pendingDiscontinuity = false;
       }
@@ -1077,29 +1128,42 @@ export class StreamLoader implements IStreamLoader, QualitySource {
       return; // Already active
     }
 
-    this.logger.info(`Switching quality to: ${level.label} (${level.url})`);
-    
-    // Save current playback position
-    const currentTime = this.isLive ? 0 : this.getCurrentTimeEstimate();
-    
-    this.activeQualityId = id;
-    this.playlistUrl = level.url;
-    
-    // Stop the current downloads & clear queue
-    const wasDownloading = this.isDownloading;
-    this.stopDownloading();
-    
-    // Reload the playlist
-    await this.loadPlaylist(level.url);
-    
-    // Restore position if VOD
-    if (!this.isLive) {
-      this.seek(currentTime);
+    // Re-entrancy guard: drop a concurrent switch rather than let two overlapping
+    // calls interleave mutations of activeQualityId/playlistUrl and both reset
+    // segment state via loadPlaylist. See `isSwitching` doc comment.
+    if (this.isSwitching) {
+      this.logger.debug(`Dropping concurrent switchQuality(${id}) — a switch is already in flight`);
+      return;
     }
-    
-    // Resume downloading if it was active
-    if (wasDownloading && this.isBackpressurePausedFn) {
-      this.startDownloading(this.isBackpressurePausedFn);
+    this.isSwitching = true;
+
+    try {
+      this.logger.info(`Switching quality to: ${level.label} (${level.url})`);
+
+      // Save current playback position
+      const currentTime = this.isLive ? 0 : this.getCurrentTimeEstimate();
+
+      this.activeQualityId = id;
+      this.playlistUrl = level.url;
+
+      // Stop the current downloads & clear queue
+      const wasDownloading = this.isDownloading;
+      this.stopDownloading();
+
+      // Reload the playlist
+      await this.loadPlaylist(level.url);
+
+      // Restore position if VOD
+      if (!this.isLive) {
+        this.seek(currentTime);
+      }
+
+      // Resume downloading if it was active
+      if (wasDownloading && this.isBackpressurePausedFn) {
+        this.startDownloading(this.isBackpressurePausedFn);
+      }
+    } finally {
+      this.isSwitching = false;
     }
   }
 

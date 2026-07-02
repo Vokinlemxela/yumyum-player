@@ -253,13 +253,28 @@ export function parseTfhdTrackID(tfhdPayload: Uint8Array): number {
          tfhdPayload[7];
 }
 
+/**
+ * Hard ceiling on the number of samples a single `trun` box may claim.
+ * Real segments carry far fewer (typically tens to low hundreds); this exists
+ * purely to bound the loop below against a hostile/corrupt `sample_count`
+ * field, which is untrusted network input.
+ */
+const MAX_TRUN_SAMPLES = 100_000;
+
 /** Parse per-sample info (size/duration/keyframe/cts) from a `trun` box payload. */
 export function parseTRUN(trunData: Uint8Array): SampleInfo[] {
   if (trunData.length < 8) return [];
 
   const flags = (trunData[1] << 16) | (trunData[2] << 8) | trunData[3];
 
-  const sampleCount = (trunData[4] << 24) | (trunData[5] << 16) | (trunData[6] << 8) | trunData[7];
+  // `>>> 0` treats the 32-bit read as unsigned so a high-bit-set value (which
+  // would otherwise become negative via the `<< 24`) doesn't slip past the
+  // upper-bound check below.
+  const sampleCount = ((trunData[4] << 24) | (trunData[5] << 16) | (trunData[6] << 8) | trunData[7]) >>> 0;
+
+  // sample_count is attacker-controlled (untrusted network bytes). Reject
+  // implausible values outright rather than looping up to 2^32-1 times.
+  if (sampleCount > MAX_TRUN_SAMPLES) return [];
 
   let offset = 8;
   if (flags & 0x000001) offset += 4; // data_offset
@@ -273,7 +288,15 @@ export function parseTRUN(trunData: Uint8Array): SampleInfo[] {
   if (flags & 0x000400) entrySize += 4;
   if (flags & 0x000800) entrySize += 4;
 
-  for (let i = 0; i < sampleCount; i++) {
+  // When entrySize is 0 (flags set none of the per-sample bits), the
+  // `offset + entrySize > trunData.length` guard inside the loop never
+  // triggers — so also cap by how many zero-size entries could plausibly fit,
+  // ensuring the loop always terminates in bounded time regardless of flags.
+  const maxIterations = entrySize > 0
+    ? Math.min(sampleCount, Math.floor((trunData.length - offset) / entrySize) + 1)
+    : sampleCount;
+
+  for (let i = 0; i < maxIterations; i++) {
     if (entrySize > 0 && offset + entrySize > trunData.length) break;
 
     let duration = 0;

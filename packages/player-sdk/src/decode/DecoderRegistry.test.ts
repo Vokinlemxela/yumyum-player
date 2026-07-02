@@ -84,6 +84,165 @@ describe('deinterleaveChannels', () => {
   });
 });
 
+/**
+ * Minimal mock of the WebCodecs `AudioDecoder` used to drive AACDecoder's real
+ * (non-fallback) path. Each `new AudioDecoder(...)` call is recorded in
+ * `MockAudioDecoder.instances` in creation order, so a test can grab a
+ * specific instance (e.g. the first one, "D1") and manually invoke its
+ * captured `output`/`error` callbacks — simulating the browser delivering a
+ * late/queued callback for a decoder that AACDecoder has since replaced.
+ */
+class MockAudioDecoder {
+  static instances: MockAudioDecoder[] = [];
+  static isConfigSupportedResult: AudioDecoderSupport = { supported: true, config: {} as AudioDecoderConfig };
+  static isConfigSupported(_config: AudioDecoderConfig): Promise<AudioDecoderSupport> {
+    return Promise.resolve(MockAudioDecoder.isConfigSupportedResult);
+  }
+
+  public state: 'unconfigured' | 'configured' | 'closed' = 'unconfigured';
+  public closeCallCount = 0;
+  public configureCalls: AudioDecoderConfig[] = [];
+  public decodeCalls: EncodedAudioChunk[] = [];
+  private readonly outputCb: (data: AudioData) => void;
+  private readonly errorCb: (e: Error) => void;
+
+  constructor(init: { output: (data: AudioData) => void; error: (e: Error) => void }) {
+    this.outputCb = init.output;
+    this.errorCb = init.error;
+    MockAudioDecoder.instances.push(this);
+  }
+
+  configure(config: AudioDecoderConfig) {
+    this.configureCalls.push(config);
+    this.state = 'configured';
+  }
+
+  decode(chunk: EncodedAudioChunk) {
+    this.decodeCalls.push(chunk);
+  }
+
+  flush(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  close() {
+    this.closeCallCount++;
+    this.state = 'closed';
+  }
+
+  /** Invoke this instance's captured `error` callback, as the browser would. */
+  triggerError(e: Error) {
+    this.errorCb(e);
+  }
+
+  /** Invoke this instance's captured `output` callback, as the browser would. */
+  triggerOutput(data: AudioData) {
+    this.outputCb(data);
+  }
+}
+
+/** Minimal fake AudioData sufficient to exercise the output callback's close(). */
+function makeFakeAudioData(): AudioData & { closeCallCount: number } {
+  let closeCallCount = 0;
+  return {
+    numberOfFrames: 1,
+    numberOfChannels: 1,
+    format: 'f32-planar',
+    sampleRate: 44100,
+    timestamp: 0,
+    copyTo: () => {},
+    close: () => { closeCallCount++; },
+    get closeCallCount() { return closeCallCount; },
+  } as unknown as AudioData & { closeCallCount: number };
+}
+
+describe('AACDecoder stale-callback guard (RES-H4)', () => {
+  // Drive AACDecoder's real AudioDecoder path (not the Web Audio fallback) via
+  // MockAudioDecoder, so handleFallback()'s decoder-swap can be exercised.
+  let savedAudioDecoder: unknown;
+  beforeEach(() => {
+    savedAudioDecoder = (globalThis as Record<string, unknown>).AudioDecoder;
+    MockAudioDecoder.instances = [];
+    MockAudioDecoder.isConfigSupportedResult = { supported: true, config: {} as AudioDecoderConfig };
+    (globalThis as Record<string, unknown>).AudioDecoder = MockAudioDecoder;
+  });
+  afterEach(() => {
+    (globalThis as Record<string, unknown>).AudioDecoder = savedAudioDecoder;
+  });
+
+  const cfg = { objectType: 2, sampleRateIndex: 4, sampleRate: 44100, channels: 2 };
+  const frame = (fill: number) => buildAdtsFrame(cfg, new Uint8Array(13).fill(fill));
+
+  // Allow pending microtasks (the `await AudioDecoder.isConfigSupported(...)`
+  // inside configureAudioDecoder) to settle before assertions.
+  const flushMicrotasks = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it('ignores a stale error callback from a decoder already replaced by handleFallback()', async () => {
+    const dec = new AACDecoder(() => {}, undefined, silent());
+
+    // First packet triggers async configuration (raw mode by default) and is
+    // queued in pendingPackets until it resolves.
+    dec.decode(frame(1), 1000, true);
+    await flushMicrotasks();
+
+    expect(MockAudioDecoder.instances).toHaveLength(1);
+    const d1 = MockAudioDecoder.instances[0];
+    expect(d1.state).toBe('configured');
+
+    // Simulate the first of two queued decode errors arriving from D1: this
+    // runs handleFallback(), which closes D1 and (since raw mode hasn't
+    // failed-over to ADTS yet) synchronously kicks off reconfiguration in
+    // ADTS mode.
+    d1.triggerError(new Error('mock decode error #1'));
+    await flushMicrotasks();
+
+    expect(d1.closeCallCount).toBe(1);
+    expect(MockAudioDecoder.instances).toHaveLength(2);
+    const d2 = MockAudioDecoder.instances[1];
+    expect(d2.state).toBe('configured');
+
+    // Now simulate the SECOND queued error callback arriving late from the
+    // now-closed D1 (this is the RES-H4 race: two `error` events queued from
+    // D1 in quick succession, the second delivered after handleFallback()
+    // already swapped in D2). Before the fix this would call handleFallback()
+    // again and tear down the healthy D2.
+    d1.triggerError(new Error('mock decode error #2 (stale)'));
+    await flushMicrotasks();
+
+    // D2 must be untouched: not closed, and no third decoder was created.
+    expect(d2.closeCallCount).toBe(0);
+    expect(MockAudioDecoder.instances).toHaveLength(2);
+  });
+
+  it('closes AudioData but takes no other action on a stale output callback', async () => {
+    const pcmCalls: number[] = [];
+    const dec = new AACDecoder((left) => { pcmCalls.push(left.length); }, undefined, silent());
+
+    dec.decode(frame(1), 1000, true);
+    await flushMicrotasks();
+
+    const d1 = MockAudioDecoder.instances[0];
+
+    // Force the D1 -> D2 swap via the same error path as above.
+    d1.triggerError(new Error('mock decode error'));
+    await flushMicrotasks();
+
+    expect(MockAudioDecoder.instances).toHaveLength(2);
+    const d2 = MockAudioDecoder.instances[1];
+
+    // A stale `output` callback firing late from the replaced D1 must not
+    // reach onPCM, and must still close() the AudioData (WebCodecs requires
+    // every AudioData to be closed or it leaks).
+    const staleAudioData = makeFakeAudioData();
+    d1.triggerOutput(staleAudioData);
+
+    expect(pcmCalls).toHaveLength(0);
+    expect(staleAudioData.closeCallCount).toBe(1);
+    // D2 remains untouched by the stale output callback.
+    expect(d2.closeCallCount).toBe(0);
+  });
+});
+
 describe('AACDecoder Web Audio fallback', () => {
   // Force the "no native AudioDecoder" path (e.g. Yandex / Chromium without
   // proprietary codecs), so audio routes through the decodeAudioData fallback.

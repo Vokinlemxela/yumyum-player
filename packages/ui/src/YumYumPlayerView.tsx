@@ -59,6 +59,13 @@ export interface YumYumPlayerViewProps {
   /**
    * Construct + load a player against the given canvas. Resolves once the
    * stream is loaded; `isLive` disables seeking and shows a LIVE badge.
+   *
+   * MUST be referentially stable across renders — wrap it in `useCallback`/
+   * `useMemo` keyed on the stream source (e.g. the URL), not defined inline.
+   * This view's player-lifecycle effect depends on `createPlayer`
+   * (`[createPlayer]`), so a new function identity on every render tears
+   * down the current player and calls `createPlayer` again, reloading the
+   * stream (flicker + rebuffer) even though nothing meaningful changed.
    */
   createPlayer: (canvas: HTMLCanvasElement) => Promise<{ player: PlayerHandle; isLive: boolean }>;
   /** Accent color for the progress bar, handle and active controls. */
@@ -339,6 +346,14 @@ export const YumYumPlayerView: React.FC<YumYumPlayerViewProps> = ({
   useEffect(() => { ensureStyles(); }, []);
 
   // ── Player lifecycle ──────────────────────────────────────────────
+  // Dependency array is intentionally just [createPlayer]: this effect
+  // creates the player on mount / whenever `createPlayer` changes identity,
+  // and tears it down (destroy + null out) on cleanup. That means
+  // `createPlayer` MUST be referentially stable (useCallback/useMemo keyed
+  // on the stream source) — callers that pass an inline/unstable function
+  // will have the player destroyed and recreated (stream reloaded) on
+  // every parent re-render. See the JSDoc on `createPlayer` in
+  // YumYumPlayerViewProps above.
   useEffect(() => {
     if (!canvasRef.current) return;
     setIsReady(false);

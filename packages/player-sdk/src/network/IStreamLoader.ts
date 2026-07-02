@@ -102,6 +102,8 @@ export interface IStreamLoader {
   wallToMedia?(wallMs: number): number | null;
   /** Absolute wall-clock coverage of the archive, or `null` when unavailable. */
   getWallClockRange?(): WallClockRange | null;
+  /** Current low-level connection state (e.g. for live stream status telemetry). */
+  getConnectionState?(): string;
   /** Release all resources. */
   destroy(): void;
 }

@@ -399,6 +399,14 @@ function demuxStream(chunk: ArrayBuffer) {
   }
 
   if (isFMP4Stream) {
+    if (streamBuffer.length + newBytes.length > MAX_STREAM_BUFFER) {
+      logError('fMP4 stream buffer overflow, resetting stream state');
+      streamBuffer = new Uint8Array(0);
+      currentFragmentSamples = [];
+      fmp4TimelineOffset = null;
+      return;
+    }
+
     if (streamBuffer.length === 0) {
       streamBuffer = newBytes;
     } else {
@@ -410,37 +418,41 @@ function demuxStream(chunk: ArrayBuffer) {
 
     let offset = 0;
     const len = streamBuffer.length;
-    
+
     while (offset + 8 <= len) {
       const size = ((streamBuffer[offset] << 24) |
                     (streamBuffer[offset + 1] << 16) |
                     (streamBuffer[offset + 2] << 8) |
                     streamBuffer[offset + 3]) >>> 0;
-      
+
       const type = String.fromCharCode(
         streamBuffer[offset + 4],
         streamBuffer[offset + 5],
         streamBuffer[offset + 6],
         streamBuffer[offset + 7]
       );
-      
-      if (size <= 0) {
+
+      // size===0 is malformed (no valid fMP4 box is empty); size>MAX_STREAM_BUFFER
+      // is implausible for a single box and, since it's read straight from
+      // untrusted bytes, could otherwise force unbounded buffering while we
+      // wait for a box that may never fully arrive.
+      if (size <= 0 || size > MAX_STREAM_BUFFER) {
         logError(`Invalid fMP4 box size: ${size} at offset ${offset}`);
         offset++;
         continue;
       }
-      
+
       if (offset + size > len) {
         // Incomplete box, wait for more data
         break;
       }
-      
+
       const boxData = streamBuffer.subarray(offset + 8, offset + size);
       processFMP4Box(type, boxData);
-      
+
       offset += size;
     }
-    
+
     if (offset > 0) {
       streamBuffer = streamBuffer.subarray(offset);
       if (streamBuffer.byteOffset > 1024 * 1024) {

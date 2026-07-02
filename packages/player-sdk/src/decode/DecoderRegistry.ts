@@ -160,9 +160,18 @@ export abstract class BaseVideoDecoder implements IBaseDecoder {
   protected recoveryAttempts = 0;
   protected readonly MAX_RECOVERY_ATTEMPTS = 3;
   protected failedCodecs: Set<string> = new Set();
-  
+
   protected decodeCount = 0;
   protected outputCount = 0;
+
+  /**
+   * Timestamps (microseconds, matching EncodedVideoChunk.timestamp) of chunks
+   * submitted as keyframes. WebCodecs VideoDecoder output does not carry
+   * keyframe info and may be reordered relative to decode() calls (B-frames),
+   * so we correlate keyframe-ness by timestamp rather than assuming FIFO.
+   * Entries are consumed (deleted) as their matching output arrives.
+   */
+  protected keyframeTimestamps: Set<number> = new Set();
 
   constructor(
     protected onFrame: (frame: DecodedFrame) => void,
@@ -190,11 +199,18 @@ export abstract class BaseVideoDecoder implements IBaseDecoder {
         if (this.outputCount % 60 === 1) {
           this.logger.debug(`${outputLogTag} Successfully decoded frame #${this.outputCount} | PTS: ${videoFrame.timestamp / 1000000}s | State: ${this.decoder?.state}`);
         }
-        
+
+        // WebCodecs output does not carry keyframe info and may be reordered
+        // relative to decode() input (B-frames), so correlate by timestamp
+        // against the set recorded when the chunk was submitted. delete()
+        // returns true iff this timestamp was recorded as a keyframe.
+        const isKeyframe = this.keyframeTimestamps.delete(videoFrame.timestamp);
+
         this.onFrame({
           pts: videoFrame.timestamp / 1000000,
           duration: (videoFrame.duration || 33333) / 1000000,
           data: videoFrame,
+          isKeyframe,
         });
       },
       error: (e) => {
@@ -229,6 +245,9 @@ export abstract class BaseVideoDecoder implements IBaseDecoder {
 
   public flush() {
     this.hasDecodedFirstKeyframe = false;
+    // Any chunks submitted before the flush will never produce output now —
+    // drop the pending correlation entries to avoid unbounded growth.
+    this.keyframeTimestamps.clear();
     if (this.decoder && this.decoder.state === 'configured') {
       this.decoder.flush().catch((err) => {
         this.logger.debug('Failed to flush video decoder:', err);
@@ -239,6 +258,7 @@ export abstract class BaseVideoDecoder implements IBaseDecoder {
   public destroy() {
     this.isDestroyed = true;
     this.hasDecodedFirstKeyframe = false;
+    this.keyframeTimestamps.clear();
     if (this.decoder) {
       if (this.decoder.state !== 'closed') {
         this.decoder.close();
@@ -304,6 +324,10 @@ export class H264Decoder extends BaseVideoDecoder {
       }
       this.decoder = null;
     }
+    // The closed decoder's pending chunks will never produce output — drop
+    // their correlation entries so a future timestamp can't collide with a
+    // stale one and be mis-flagged.
+    this.keyframeTimestamps.clear();
 
     this.setupNativeDecoder('H264');
   }
@@ -320,6 +344,9 @@ export class H264Decoder extends BaseVideoDecoder {
           pts: timestampUs / 1000000,
           duration: 33333 / 1000000,
           data: bitmap,
+          // Each mock frame is a standalone synthetic image with no GOP
+          // dependency on any other frame — safe to treat as a keyframe.
+          isKeyframe: true,
         });
       }).catch((e) => {
         this.logger.error('Failed to generate mock H.264 frame:', e);
@@ -387,6 +414,9 @@ export class H264Decoder extends BaseVideoDecoder {
         timestamp: timestampUs,
         data: packet,
       });
+      // Record the timestamp before submitting so the output callback can
+      // correlate it back (output ordering may differ from decode ordering).
+      if (isKeyframe) this.keyframeTimestamps.add(timestampUs);
       this.decoder.decode(chunk);
     } catch (err) {
       this.logger.warn('Native decode error, attempting recovery:', err);
@@ -505,6 +535,10 @@ export class HEVCDecoder extends BaseVideoDecoder {
       }
       this.decoder = null;
     }
+    // The closed decoder's pending chunks will never produce output — drop
+    // their correlation entries so a future timestamp can't collide with a
+    // stale one and be mis-flagged.
+    this.keyframeTimestamps.clear();
 
     this.probeAndInitialize();
   }
@@ -523,6 +557,9 @@ export class HEVCDecoder extends BaseVideoDecoder {
           pts: timestampUs / 1000000,
           duration: 33333 / 1000000,
           data: bitmap,
+          // Each mock frame is a standalone synthetic image with no GOP
+          // dependency on any other frame — safe to treat as a keyframe.
+          isKeyframe: true,
         });
       }).catch((e) => {
         this.logger.error('Failed to generate mock HEVC frame:', e);
@@ -581,6 +618,9 @@ export class HEVCDecoder extends BaseVideoDecoder {
         timestamp: timestampUs,
         data: packet,
       });
+      // Record the timestamp before submitting so the output callback can
+      // correlate it back (output ordering may differ from decode ordering).
+      if (isKeyframe) this.keyframeTimestamps.add(timestampUs);
       this.decoder.decode(chunk);
     } catch (err) {
       this.logger.warn('Native decode error, attempting recovery:', err);
@@ -637,6 +677,9 @@ export class MJPEGDecoder implements IBaseDecoder {
           pts: timestampUs / 1000000,
           duration: 33333 / 1000000,
           data: bitmap, // ImageBitmap is a transferable object
+          // MJPEG has no inter-frame dependency — every frame is a standalone
+          // JPEG image, i.e. effectively a keyframe.
+          isKeyframe: true,
         });
       })
       .catch((err) => {
@@ -813,8 +856,21 @@ export class AACDecoder implements IBaseDecoder {
       }
     }
 
-    this.decoder = new AudioDecoder({
+    // Captured by the closures below (rather than reading `this.decoder`) so a
+    // stale callback from a decoder that has since been replaced by
+    // handleFallback() can detect it no longer belongs to the current
+    // instance and no-op. Without this, two queued callbacks from the same
+    // now-closed decoder (e.g. two `error` events in quick succession) could
+    // each independently call handleFallback(), the second one tearing down
+    // the healthy replacement decoder created by the first.
+    const decoder = new AudioDecoder({
       output: (audioData) => {
+        if (this.decoder !== decoder) {
+          // Stale: a newer decoder has already replaced this one. WebCodecs
+          // AudioData must always be closed, even when discarded.
+          audioData.close();
+          return;
+        }
         try {
           const numFrames = audioData.numberOfFrames;
           const numChannels = audioData.numberOfChannels;
@@ -854,14 +910,23 @@ export class AACDecoder implements IBaseDecoder {
         }
       },
       error: (e) => {
+        if (this.decoder !== decoder) {
+          // Stale callback from a decoder already replaced by handleFallback()
+          // — ignore, otherwise this would tear down the current (healthy)
+          // replacement decoder.
+          return;
+        }
         this.decodeErrorCount++;
         this.logger.warn(`Decode error #${this.decodeErrorCount} (mode: ${this.useAdtsMode ? 'ADTS' : 'raw'}):`, e);
         this.handleFallback();
       },
     });
+    this.decoder = decoder;
 
     try {
-      this.decoder.configure(config);
+      // Synchronous — runs immediately on the `decoder` just created above, so
+      // it is inherently current; no staleness check needed here.
+      decoder.configure(config);
       this.isConfigured = true;
       this.isConfiguring = false;
       this.currentSampleRate = sampleRate;

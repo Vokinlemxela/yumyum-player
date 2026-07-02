@@ -13,6 +13,13 @@ export interface DecodedFrame {
     vPlane: Uint8Array;
   };
   duration: number; // in seconds
+  /**
+   * True if this frame originated from a keyframe (GOP leader) chunk. Decoder
+   * output can be reordered relative to decode input (B-frames), so this is
+   * correlated by timestamp rather than assumed FIFO — see DecoderRegistry.
+   * Undefined/false is treated as "not known to be a keyframe" (delta frame).
+   */
+  isKeyframe?: boolean;
 }
 
 export type PlaybackState = 'IDLE' | 'PLAYING' | 'PAUSED';
@@ -141,7 +148,11 @@ export class PlaybackController {
     this.decodedFramesCount++;
 
     if (this.targetFps !== undefined) {
-      if (this.lastKeptPts !== -1 && frame.pts >= this.lastKeptPts && frame.pts - this.lastKeptPts < (1 / this.targetFps) - 0.005) {
+      // Never decimate a keyframe: it's the GOP leader that later frames in
+      // the same group depend on for decode continuity. Keyframes are rare
+      // (once per GOP) so always keeping them has negligible FPS impact.
+      const isDecimationCandidate = this.lastKeptPts !== -1 && frame.pts >= this.lastKeptPts && frame.pts - this.lastKeptPts < (1 / this.targetFps) - 0.005;
+      if (isDecimationCandidate && !frame.isKeyframe) {
         if (frame.data && 'close' in frame.data) {
           try {
             frame.data.close();
@@ -350,12 +361,29 @@ export class PlaybackController {
     if (this.lastRenderedPTS !== -1 && this.frameQueue.length > 0) {
       // 1. Queue size catch-up (Live streams only)
       // Dynamic limits based on FPS to avoid conflicts with HLS segment buffers.
-      const fps = this.targetFps ?? 25;
-      const catchupThreshold = Math.max(150, fps * TimingPolicy.CATCHUP_THRESHOLD_MULT);
-      const catchupTarget = Math.max(60, Math.floor(fps * TimingPolicy.CATCHUP_TARGET_MULT));
+      // Shared with checkBackpressure() so the producer throttle and the
+      // post-hoc drop threshold agree with each other.
+      const { high: catchupThreshold, low: catchupTarget } = this.getLiveQueueWatermarks();
 
       if (this.duration === Infinity && this.frameQueue.length > catchupThreshold) {
-        const dropCount = this.frameQueue.length - catchupTarget;
+        let dropCount = this.frameQueue.length - catchupTarget;
+        // Preserve decode continuity: the surviving head must be a keyframe,
+        // otherwise the renderer paints a delta frame with no reference and
+        // shows a frozen/garbled image until the next GOP. Snap the cut
+        // forward to the nearest keyframe at or after the computed boundary.
+        // If no keyframe exists in the remainder of the queue (degenerate /
+        // GOP-less stream), fall back to the original cut rather than
+        // dropping the entire queue.
+        if (dropCount < this.frameQueue.length) {
+          let snapIdx = -1;
+          for (let i = dropCount; i < this.frameQueue.length; i++) {
+            if (this.frameQueue[i].isKeyframe) {
+              snapIdx = i;
+              break;
+            }
+          }
+          if (snapIdx !== -1) dropCount = snapIdx;
+        }
         const droppedFrames = this.frameQueue.splice(0, dropCount);
         for (const dropped of droppedFrames) {
           if (dropped.data && 'close' in dropped.data) {
@@ -472,7 +500,12 @@ export class PlaybackController {
       const first = this.frameQueue[0];
       const delta = first.pts - currentClock;
 
-      if (delta < -FRAME_LAG_THRESHOLD) {
+      // A late keyframe is the GOP's leader — dropping it would strand any
+      // dependent delta frames behind it without a base to resync on. Prefer
+      // to render it (fall through to the "best frame" branch below) over
+      // silently discarding it, unless doing so is simply not possible (queue
+      // logic below still applies normally otherwise).
+      if (delta < -FRAME_LAG_THRESHOLD && !first.isKeyframe) {
         // Frame is too late! Drop it without rendering
         const dropped = this.frameQueue.shift()!;
         if (dropped.data && 'close' in dropped.data) {
@@ -557,10 +590,37 @@ export class PlaybackController {
     this.scheduleTick();
   }
 
-  private checkBackpressure() {
-    if (this.duration === Infinity) return;
+  /**
+   * High/low-water marks for the live decoded-frame queue. Reuses the same
+   * FPS-scaled formula as the live catch-up drop in tick() so the producer
+   * throttle and the post-hoc drop threshold agree with each other.
+   */
+  private getLiveQueueWatermarks(): { high: number; low: number } {
+    const fps = this.targetFps ?? 25;
+    return {
+      high: Math.max(150, fps * TimingPolicy.CATCHUP_THRESHOLD_MULT),
+      low: Math.max(60, Math.floor(fps * TimingPolicy.CATCHUP_TARGET_MULT)),
+    };
+  }
 
+  private checkBackpressure() {
     const len = this.frameQueue.length;
+
+    if (this.duration === Infinity) {
+      // Live: the queue is otherwise only bounded by post-hoc catch-up
+      // dropping, which lets the decoded-frame queue (each entry pinning a
+      // GPU texture) spike under decoder slowdown. Throttle the producer
+      // (worker decoding) directly instead of relying solely on dropping.
+      const { high, low } = this.getLiveQueueWatermarks();
+      if (!this.isBackpressurePaused && len > high) {
+        this.isBackpressurePaused = true;
+        this.onBackpressureChange?.(true); // Trigger PAUSE_DECODING
+      } else if (this.isBackpressurePaused && len <= low) {
+        this.isBackpressurePaused = false;
+        this.onBackpressureChange?.(false); // Trigger RESUME_DECODING
+      }
+      return;
+    }
 
     if (!this.isBackpressurePaused && len >= this.maxQueueSize) {
       this.isBackpressurePaused = true;

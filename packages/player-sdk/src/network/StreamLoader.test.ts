@@ -736,6 +736,383 @@ low_1.ts
   });
 });
 
+// ─── switchQuality re-entrancy guard ─────────────────────────────────
+
+describe('StreamLoader switchQuality re-entrancy', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Master + two media playlists, mirroring the fixtures used by the existing
+   * "switches quality levels" test. The `high` media-playlist fetch is
+   * deferred so a test can hold the first switchQuality() call mid-`await`
+   * and fire a second, overlapping call while it is still in flight.
+   */
+  function installQualitySwitchFetchMock(fetches: string[]) {
+    const mediaHigh = `
+#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXTINF:6.0,
+high_0.ts
+#EXTINF:6.0,
+high_1.ts
+#EXT-X-ENDLIST
+    `.trim();
+
+    const mediaLow = `
+#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXTINF:6.0,
+low_0.ts
+#EXTINF:6.0,
+low_1.ts
+#EXT-X-ENDLIST
+    `.trim();
+
+    const mediaSub = `
+#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXTINF:6.0,
+sub_0.ts
+#EXTINF:6.0,
+sub_1.ts
+#EXT-X-ENDLIST
+    `.trim();
+
+    const masterPlaylist = `
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=320x240
+sub/stream.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+low/stream.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+high/stream.m3u8
+    `.trim();
+
+    // Resolved so the second (`high`) fetch only settles once explicitly released,
+    // guaranteeing the first switchQuality() call is still mid-`loadPlaylist` when
+    // the second, overlapping call is issued.
+    let releaseHigh: (() => void) | null = null;
+    const highGate = new Promise<void>((resolve) => { releaseHigh = resolve; });
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      fetches.push(url);
+      if (url === 'https://example.com/stream.m3u8') {
+        return { ok: true, status: 200, text: () => Promise.resolve(masterPlaylist) } as any;
+      }
+      if (url === 'https://example.com/high/stream.m3u8') {
+        await highGate; // held open until the test calls releaseHigh()
+        return { ok: true, status: 200, text: () => Promise.resolve(mediaHigh) } as any;
+      }
+      if (url === 'https://example.com/low/stream.m3u8') {
+        return { ok: true, status: 200, text: () => Promise.resolve(mediaLow) } as any;
+      }
+      if (url === 'https://example.com/sub/stream.m3u8') {
+        return { ok: true, status: 200, text: () => Promise.resolve(mediaSub) } as any;
+      }
+      return Promise.reject(new Error(`Unexpected fetch URL: ${url}`));
+    });
+
+    return { releaseHigh: () => releaseHigh!() };
+  }
+
+  it('drops a concurrent switchQuality() call and leaves activeQualityId/segments consistent', async () => {
+    const fetches: string[] = [];
+    const { releaseHigh } = installQualitySwitchFetchMock(fetches);
+
+    const loader = makeLoader(() => {});
+    await loader.load('https://example.com/stream.m3u8');
+    // Master playlist sorts by bitrate desc; active defaults to the first (lowest
+    // bitrate is last after sort) — pin the starting point explicitly instead of
+    // relying on the default.
+    await loader.quality!.switchQuality('https://example.com/sub/stream.m3u8');
+    expect(loader.getActiveId()).toBe('https://example.com/sub/stream.m3u8');
+
+    fetches.length = 0;
+
+    // Fire the manual switch to "high" — its media-playlist fetch is gated and
+    // won't resolve until releaseHigh() is called below, so this call is
+    // guaranteed to still be inside loadPlaylist() when the second call fires.
+    const firstSwitch = loader.quality!.switchQuality('https://example.com/high/stream.m3u8');
+
+    // Give the first call's microtasks a beat to reach the gated fetch.
+    await waitFor(() => fetches.includes('https://example.com/high/stream.m3u8'));
+
+    // Overlapping ABR-style switch to "low" while the first call is mid-flight.
+    // Must be dropped by the re-entrancy guard, not interleaved.
+    const secondSwitch = loader.quality!.switchQuality('https://example.com/low/stream.m3u8');
+
+    // The dropped call resolves immediately (early return) — await it now so it
+    // can't race the first call's completion below.
+    await secondSwitch;
+    // The "low" playlist must never have been fetched: the concurrent call was
+    // dropped before it could mutate any shared state.
+    expect(fetches).not.toContain('https://example.com/low/stream.m3u8');
+    // activeQualityId must not have been clobbered by the dropped call while the
+    // first switch was still in flight.
+    expect(loader.getActiveId()).toBe('https://example.com/high/stream.m3u8');
+
+    // Now let the first (in-flight) switch complete.
+    releaseHigh();
+    await firstSwitch;
+
+    // Final state matches the call that actually completed ("high"), and the
+    // segment list reflects ONLY the high playlist (no corruption/mixing).
+    expect(loader.getActiveId()).toBe('https://example.com/high/stream.m3u8');
+    const segments = (loader as any).segments as { url: string }[];
+    expect(segments.map((s) => s.url)).toEqual([
+      'https://example.com/high/high_0.ts',
+      'https://example.com/high/high_1.ts',
+    ]);
+    expect((loader as any).isSwitching).toBe(false);
+
+    loader.destroy();
+  });
+
+  it('clears the isSwitching guard even if loadPlaylist rejects, so a later switch can proceed', async () => {
+    const fetches: string[] = [];
+    const masterPlaylist = `
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+low/stream.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+high/stream.m3u8
+    `.trim();
+    const mediaLow = `
+#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXTINF:6.0,
+low_0.ts
+#EXT-X-ENDLIST
+    `.trim();
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      fetches.push(url);
+      if (url === 'https://example.com/stream.m3u8') {
+        return { ok: true, status: 200, text: () => Promise.resolve(masterPlaylist) } as any;
+      }
+      if (url === 'https://example.com/low/stream.m3u8') {
+        return { ok: true, status: 200, text: () => Promise.resolve(mediaLow) } as any;
+      }
+      if (url === 'https://example.com/high/stream.m3u8') {
+        return { ok: false, status: 500 } as any; // loadPlaylist throws on this
+      }
+      return Promise.reject(new Error(`Unexpected fetch URL: ${url}`));
+    });
+
+    const loader = makeLoader(() => {});
+    await loader.load('https://example.com/stream.m3u8');
+    expect(loader.getActiveId()).toBe('https://example.com/low/stream.m3u8');
+
+    await expect(loader.quality!.switchQuality('https://example.com/high/stream.m3u8')).rejects.toThrow();
+
+    // The guard must clear in the `finally` branch even though loadPlaylist threw.
+    expect((loader as any).isSwitching).toBe(false);
+
+    // A subsequent switch must not be dropped by a stuck guard.
+    fetches.length = 0;
+    await loader.quality!.switchQuality('https://example.com/low/stream.m3u8');
+    expect(fetches).toContain('https://example.com/low/stream.m3u8');
+
+    loader.destroy();
+    vi.restoreAllMocks();
+  });
+});
+
+// ─── Playlist URL resolution (segments, variants, EXT-X-MAP) ────────
+
+describe('StreamLoader playlist URL resolution', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('resolves relative, root-absolute, and absolute segment URLs against the playlist base', async () => {
+    const playlist = `
+#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXTINF:6.0,
+relative_0.ts
+#EXTINF:6.0,
+/root/absolute_1.ts
+#EXTINF:6.0,
+https://cdn.example.com/abs/absolute_2.ts
+#EXT-X-ENDLIST
+    `.trim();
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url: any) => {
+      if (url === 'https://example.com/streams/nested/stream.m3u8') {
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(playlist) } as any);
+      }
+      return Promise.resolve({ ok: true, arrayBuffer: async () => makeTsSegment() } as any);
+    });
+
+    const loader = makeLoader(() => {});
+    await loader.loadPlaylist('https://example.com/streams/nested/stream.m3u8');
+
+    const segments = (loader as any).segments as { url: string }[];
+    expect(segments.map((s) => s.url)).toEqual([
+      // Relative → resolved against the playlist's directory.
+      'https://example.com/streams/nested/relative_0.ts',
+      // Root-absolute → resolved against the playlist's origin, NOT concatenated
+      // onto the directory (naive `baseUrl + '/root/...'` would have produced
+      // 'https://example.com/streams/nested//root/absolute_1.ts').
+      'https://example.com/root/absolute_1.ts',
+      // Already absolute → passed through (different origin allowed; scheme is
+      // still https).
+      'https://cdn.example.com/abs/absolute_2.ts',
+    ]);
+
+    loader.destroy();
+  });
+
+  it('rejects a segment URI with a javascript: or file: scheme and skips that entry', async () => {
+    const playlist = `
+#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXTINF:6.0,
+good_0.ts
+#EXTINF:6.0,
+javascript:alert(1)
+#EXTINF:6.0,
+file:///etc/passwd
+#EXTINF:6.0,
+good_1.ts
+#EXT-X-ENDLIST
+    `.trim();
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url: any) => {
+      if (url === 'https://example.com/streams/stream.m3u8') {
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(playlist) } as any);
+      }
+      return Promise.resolve({ ok: true, arrayBuffer: async () => makeTsSegment() } as any);
+    });
+
+    const loader = makeLoader(() => {});
+    await loader.loadPlaylist('https://example.com/streams/stream.m3u8');
+
+    // The malicious/invalid-scheme entries are dropped entirely — only the two
+    // legitimate http(s) segments remain in the queue.
+    const segments = (loader as any).segments as { url: string }[];
+    expect(segments.map((s) => s.url)).toEqual([
+      'https://example.com/streams/good_0.ts',
+      'https://example.com/streams/good_1.ts',
+    ]);
+
+    loader.destroy();
+  });
+
+  it('rejects a master-playlist variant with a disallowed scheme and keeps only valid levels', async () => {
+    const masterPlaylist = `
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+low/stream.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=960x540
+file:///etc/variant.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+high/stream.m3u8
+    `.trim();
+
+    const mediaLow = `
+#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXTINF:6.0,
+low_0.ts
+#EXT-X-ENDLIST
+    `.trim();
+
+    const fetches: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url: any) => {
+      fetches.push(url);
+      if (url === 'https://example.com/stream.m3u8') {
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(masterPlaylist) } as any);
+      }
+      if (url === 'https://example.com/low/stream.m3u8') {
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(mediaLow) } as any);
+      }
+      return Promise.reject(new Error(`Unexpected fetch URL (should not resolve the file: variant): ${url}`));
+    });
+
+    const loader = makeLoader(() => {});
+    await loader.load('https://example.com/stream.m3u8');
+
+    // Only the two http(s) variants were parsed; the file: variant never
+    // reached getLevels() and was never fetched.
+    const levels = loader.getLevels();
+    expect(levels.map((l) => l.url)).toEqual([
+      'https://example.com/high/stream.m3u8', // sorted by bitrate desc
+      'https://example.com/low/stream.m3u8',
+    ]);
+    expect(fetches.some((u) => u.includes('etc/variant'))).toBe(false);
+
+    loader.destroy();
+  });
+
+  it('resolves an EXT-X-MAP init segment URI and rejects a disallowed scheme', async () => {
+    const goodMapPlaylist = `
+#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-MAP:URI="init/segment.mp4"
+#EXTINF:6.0,
+seg_0.m4s
+#EXT-X-ENDLIST
+    `.trim();
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url: any) => {
+      if (url === 'https://example.com/streams/stream.m3u8') {
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(goodMapPlaylist) } as any);
+      }
+      return Promise.resolve({ ok: true, arrayBuffer: async () => makeTsSegment() } as any);
+    });
+
+    const loader = makeLoader(() => {});
+    await loader.loadPlaylist('https://example.com/streams/stream.m3u8');
+    expect((loader as any).initSegmentUrl).toBe('https://example.com/streams/init/segment.mp4');
+    loader.destroy();
+    vi.restoreAllMocks();
+
+    // Disallowed-scheme EXT-X-MAP URI: resolved to '', so loadPlaylist's
+    // `if (this.initSegmentUrl)` guard skips fetching it entirely.
+    const badMapPlaylist = `
+#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-MAP:URI="javascript:alert(1)"
+#EXTINF:6.0,
+seg_0.m4s
+#EXT-X-ENDLIST
+    `.trim();
+
+    const fetches: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url: any) => {
+      fetches.push(url);
+      if (url === 'https://example.com/streams/bad.m3u8') {
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(badMapPlaylist) } as any);
+      }
+      return Promise.resolve({ ok: true, arrayBuffer: async () => makeTsSegment() } as any);
+    });
+
+    const loader2 = makeLoader(() => {});
+    await loader2.loadPlaylist('https://example.com/streams/bad.m3u8');
+    expect((loader2 as any).initSegmentUrl).toBe('');
+    expect(fetches.some((u) => u.startsWith('javascript:'))).toBe(false);
+
+    loader2.destroy();
+  });
+
+  it('leaves mock:// playlist URL handling untouched by the http(s) URL hardening', async () => {
+    const loader = makeLoader(() => {});
+    await loader.loadPlaylist('mock://camera-1');
+
+    const segments = (loader as any).segments as { url: string }[];
+    expect(segments.length).toBe(20); // generateMockPlaylist's fixed mock segment count
+    expect(segments.every((s) => s.url.startsWith('mock://camera-1/segment_'))).toBe(true);
+
+    loader.destroy();
+  });
+});
+
 describe('StreamLoader EWMA throughput', () => {
   it('initializes throughput with the first sample', () => {
     const loader = makeLoader(() => {});

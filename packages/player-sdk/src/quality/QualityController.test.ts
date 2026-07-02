@@ -3,7 +3,7 @@ import { QualityController } from './QualityController.js';
 import { QualitySource, QualityLevel } from './QualitySource.js';
 import { StreamSignals } from './Signals.js';
 import { Logger } from '../utils/Logger.js';
-import { shouldEmitQualityChangeOnUnchangedRendition } from '../index.js';
+import { shouldEmitQualityChangeOnUnchangedRendition, clampToMaxQualityKind } from '../index.js';
 
 describe('QualityController ABR logic', () => {
   let mockSource: QualitySource;
@@ -243,6 +243,54 @@ describe('QualityController ABR logic', () => {
     expect(activeId).toBe('level-sub');
   });
 
+  // ─── Regression: hard ceiling not enforced in manual mode ─────────
+  //
+  // setMaxQualityKind() is a HARD CEILING (density constraint for multi-camera
+  // grid layouts, e.g. cap all cells to 'sub' to protect GPU/bandwidth). It
+  // must be enforced in BOTH auto and manual mode. Previously the controller
+  // only called evaluateRestriction() when `mode === 'auto'`, so setting a
+  // 'sub' ceiling while a cell was manually pinned to 'main' silently stored
+  // the restriction but never forced the active rendition down.
+  it('forces down-switch immediately when a density limit is set in MANUAL mode', () => {
+    activeId = 'level-main';
+    const controller = new QualityController(mockSource, logger, { mode: 'manual' });
+    const switchEvents: Array<{ id: string; reason: string }> = [];
+    controller.onQualitySwitch = (id, reason) => switchEvents.push({ id, reason });
+
+    // Restrict to sub while in MANUAL mode with active = main.
+    controller.setMaxQualityKind('sub');
+
+    // The controller must clamp down immediately, regardless of mode.
+    expect(switchCalls).toContain('level-sub');
+    expect(activeId).toBe('level-sub');
+    expect(controller.getMode()).toBe('manual'); // restriction does not itself change mode
+    expect(switchEvents).toHaveLength(1);
+    expect(switchEvents[0].id).toBe('level-sub');
+  });
+
+  it('does NOT force a change when the ceiling is cleared or raised in manual mode', () => {
+    // Start pinned to sub in manual mode (e.g. user manually selected sub
+    // while a 'sub' ceiling was active).
+    activeId = 'level-sub';
+    const controller = new QualityController(mockSource, logger, { mode: 'manual' });
+    controller.setMaxQualityKind('sub');
+    switchCalls.length = 0; // discard the (no-op) switch from setting the ceiling
+
+    // Clearing the ceiling must not force any change — it just lifts the cap;
+    // the current manual selection (sub) stays.
+    controller.setMaxQualityKind(null);
+    expect(switchCalls).toHaveLength(0);
+    expect(activeId).toBe('level-sub');
+
+    // Raising the ceiling back up to 'main' must also not force an UP-switch —
+    // there is no stored pre-clamp intent to restore.
+    controller.setMaxQualityKind('sub'); // re-restrict first
+    switchCalls.length = 0;
+    controller.setMaxQualityKind('main');
+    expect(switchCalls).toHaveLength(0);
+    expect(activeId).toBe('level-sub');
+  });
+
   it('reports the real underlying rendition kind even while in auto mode', () => {
     activeId = 'level-main';
     const controller = new QualityController(mockSource, logger, { mode: 'auto' });
@@ -332,5 +380,133 @@ describe('QualityController ABR logic', () => {
     expect(shouldEmitQualityChangeOnUnchangedRendition(false, true)).toBe(true);
     // rendition unchanged + mode unchanged → silent
     expect(shouldEmitQualityChangeOnUnchangedRendition(false, false)).toBe(false);
+  });
+
+  // ─── Regression: index.ts setQuality() bypasses the density ceiling ────
+  //
+  // The player's `setQuality(id)` resolved 'main'/'sub' aliases to a concrete
+  // level id and called `activeLoader.quality.switchQuality(resolvedId)`
+  // directly — bypassing the QualityController entirely. So
+  // `setQuality('main')` under a 'sub' density ceiling (grid density limit)
+  // would happily switch to and play 'main', silently violating the ceiling.
+  //
+  // `clampToMaxQualityKind` is the exact (exported, pure) function
+  // `index.ts`'s setQuality() now calls to clamp the resolved target before
+  // switching/comparing against the active id — these tests exercise it
+  // directly, and the second test below replays setQuality()'s full
+  // resolve → clamp → compare → emit sequence the way the player does,
+  // reusing the REAL QualityController + the REAL exported decision helpers
+  // (this file cannot instantiate the full YumYumPlayer — it needs a canvas/
+  // WebGL2 context — so this replay is the most faithful level testable).
+  describe('clampToMaxQualityKind (index.ts setQuality density-ceiling clamp)', () => {
+    it('clamps a request that exceeds the ceiling down to the highest conforming level', () => {
+      const clamped = clampToMaxQualityKind(mockLevels, 'level-main', 'sub');
+      expect(clamped).toBe('level-sub');
+    });
+
+    it('does not clamp when the target already conforms to the ceiling', () => {
+      const clamped = clampToMaxQualityKind(mockLevels, 'level-sub', 'sub');
+      expect(clamped).toBe('level-sub');
+    });
+
+    it('does not clamp when there is no ceiling (null)', () => {
+      const clamped = clampToMaxQualityKind(mockLevels, 'level-main', null);
+      expect(clamped).toBe('level-main');
+    });
+
+    it('does not clamp when the ceiling is main (nothing exceeds the top)', () => {
+      const clamped = clampToMaxQualityKind(mockLevels, 'level-main', 'main');
+      expect(clamped).toBe('level-main');
+    });
+
+    it("picks the highest-bitrate conforming level when multiple 'sub' levels exist", () => {
+      const levels: QualityLevel[] = [
+        { id: 'level-main', label: '720p', url: 'main', kind: 'main', bitrateKbps: 2000 },
+        { id: 'level-sub', label: '360p', url: 'sub', kind: 'sub', bitrateKbps: 500 },
+        { id: 'level-tiny', label: '144p', url: 'tiny', kind: 'sub', bitrateKbps: 100 },
+      ];
+      const clamped = clampToMaxQualityKind(levels, 'level-main', 'sub');
+      expect(clamped).toBe('level-sub'); // highest bitrate among conforming ('sub') levels
+    });
+
+    it('replays setQuality("main") under a sub ceiling: clamps target AND emits the clamped id', () => {
+      // Player is manual, active is already 'level-sub' (e.g. the user had
+      // previously picked sub, or ABR had pre-empted down to it).
+      activeId = 'level-sub';
+      const controller = new QualityController(mockSource, logger, { mode: 'manual' });
+      controller.setMaxQualityKind('sub'); // grid density ceiling in effect
+
+      const emitted: Array<{ event: string; id: string }> = [];
+      const emit = (event: string, id: string) => emitted.push({ event, id });
+
+      // Replay setQuality('main') exactly as index.ts does post-fix:
+      // resolve alias → clamp against the ceiling → compare → switch/emit.
+      const modeChanged = controller.getMode() !== 'manual'; // false, already manual
+      controller.setMode('manual');
+
+      const resolvedAlias = mockLevels.find(l => l.kind === 'main')!.id; // 'level-main'
+      const clampedId = clampToMaxQualityKind(mockLevels, resolvedAlias, controller.getMaxQualityKind());
+      expect(clampedId).toBe('level-sub'); // clamped DOWN from main to sub
+
+      const currentActiveId = mockSource.getActiveId();
+      const renditionChanged = currentActiveId !== clampedId; // false — already sub
+
+      if (renditionChanged) {
+        mockSource.switchQuality(clampedId);
+        emit('qualitychange', clampedId);
+      } else if (shouldEmitQualityChangeOnUnchangedRendition(renditionChanged, modeChanged)) {
+        emit('qualitychange', clampedId);
+      }
+
+      // The player must never end up playing 'main' — the ceiling holds, and
+      // consumers see the clamped ('sub') id, not the originally-requested one.
+      // (Mode was already manual and the clamped rendition was already active,
+      // so no event fires at all here — see the truth table above.)
+      expect(mockSource.getActiveId()).toBe('level-sub');
+      expect(emitted).toEqual([]);
+    });
+
+    it('replays setQuality("main") under a sub ceiling: SWITCH path also respects the clamp (not just the unchanged-rendition path)', () => {
+      // Three levels so the clamped target ('level-sub', highest-bitrate
+      // conforming) is a DIFFERENT id than the currently-active one
+      // ('level-tiny'), forcing the replay through the renditionChanged=true
+      // switch path rather than the unchanged-rendition emit path.
+      const levels: QualityLevel[] = [
+        { id: 'level-main', label: '720p', url: 'main', kind: 'main', bitrateKbps: 2000 },
+        { id: 'level-sub', label: '360p', url: 'sub', kind: 'sub', bitrateKbps: 500 },
+        { id: 'level-tiny', label: '144p', url: 'tiny', kind: 'sub', bitrateKbps: 100 },
+      ];
+      mockLevels = levels;
+      activeId = 'level-tiny';
+      const controller = new QualityController(mockSource, logger, { mode: 'manual' });
+      controller.setMaxQualityKind('sub'); // active kind is already 'sub' -> no forced switch here
+      expect(mockSource.getActiveId()).toBe('level-tiny');
+      switchCalls.length = 0; // isolate from the ceiling-set call above
+
+      const emitted: Array<{ event: string; id: string }> = [];
+      const emit = (event: string, id: string) => emitted.push({ event, id });
+
+      const modeChanged = controller.getMode() !== 'manual'; // false
+      controller.setMode('manual');
+
+      const resolvedAlias = levels.find(l => l.kind === 'main')!.id; // 'level-main'
+      const clampedId = clampToMaxQualityKind(levels, resolvedAlias, controller.getMaxQualityKind());
+      expect(clampedId).toBe('level-sub'); // highest-bitrate conforming level, NOT level-tiny
+
+      const currentActiveId = mockSource.getActiveId(); // 'level-tiny'
+      const renditionChanged = currentActiveId !== clampedId; // true — tiny !== sub
+
+      if (renditionChanged) {
+        mockSource.switchQuality(clampedId);
+        emit('qualitychange', clampedId);
+      } else if (shouldEmitQualityChangeOnUnchangedRendition(renditionChanged, modeChanged)) {
+        emit('qualitychange', clampedId);
+      }
+
+      // Switched to the CLAMPED id (sub), never to the originally-requested main.
+      expect(switchCalls).toEqual(['level-sub']);
+      expect(mockSource.getActiveId()).toBe('level-sub');
+      expect(emitted).toEqual([{ event: 'qualitychange', id: 'level-sub' }]);
+    });
   });
 });
